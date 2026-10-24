@@ -56,14 +56,13 @@ def connect(path):
 
 @contextmanager
 def transaction(path):
-    with closing(connect(path)) as db:
-        try:
-            db.execute('BEGIN IMMEDIATE')
+    db=connect(path)
+    try:
+        db.execute('BEGIN IMMEDIATE')
+        with db:
             yield db
-            db.commit()
-        except BaseException:
-            db.rollback()
-            raise
+    finally:
+        db.close()
 
 
 def mask_card(number):

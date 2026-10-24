@@ -73,7 +73,10 @@ def ping_host(host):
 
 class PinnedHTTPSConnection(HTTPSConnection):
     def __init__(self,hostname,address):
-        super().__init__(hostname,port=443,timeout=3,context=ssl.create_default_context())
+        context=ssl.create_default_context()
+        context.check_hostname=True
+        context.verify_mode=ssl.CERT_REQUIRED
+        super().__init__(hostname,port=443,timeout=3,context=context)
         self.address=address
 
     def connect(self):

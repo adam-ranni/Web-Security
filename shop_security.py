@@ -12,11 +12,9 @@ from urllib.parse import urlsplit
 
 import jwt
 from flask import abort, current_app, g, jsonify, redirect, request, session, url_for
-from flask_wtf.csrf import CSRFProtect
 from werkzeug.security import check_password_hash, generate_password_hash
 from storage import connect, transaction
 
-csrf=CSRFProtect()
 DUMMY_PASSWORD=generate_password_hash(secrets.token_urlsafe(32))
 SESSION_SECONDS=1800
 
@@ -65,7 +63,6 @@ def configure(app):
         TRUSTED_HOSTS=os.environ.get('BOOKSHOP_TRUSTED_HOSTS','localhost,127.0.0.1').split(','))
     if secrets.compare_digest(app.secret_key,app.config['JWT_SECRET']):
         raise RuntimeError('Session and JWT secrets must be different')
-    csrf.init_app(app)
 
     @app.before_request
     def load_identity():
@@ -137,7 +134,8 @@ def valid_password(value):
 
 def email(value):
     value=text(value,254).lower()
-    if not re.fullmatch(r'[^\s@]+@[^\s@]+\.[^\s@]+',value):
+    local,separator,domain=value.partition('@')
+    if not local or not separator or '@' in domain or '.' not in domain or not all(domain.split('.')) or any(character.isspace() for character in value):
         abort(400,description='Invalid email address')
     return value
 

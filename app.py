@@ -12,8 +12,8 @@ from pathlib import Path
 
 import click
 import jwt
-from flask import send_from_directory, Flask, abort, flash, g, jsonify, make_response, redirect, render_template, request, session, url_for
-from flask_wtf.csrf import CSRFError, generate_csrf
+from flask import Response, send_from_directory, Flask, abort, flash, g, jsonify, make_response, redirect, render_template, request, session, url_for
+from flask_wtf.csrf import CSRFProtect, CSRFError, generate_csrf
 from werkzeug.exceptions import HTTPException
 from werkzeug.security import generate_password_hash
 
@@ -29,6 +29,7 @@ from shop_security import (admin_required, authenticate, configure, current_pass
 
 app=Flask(__name__)
 configure(app)
+csrf=CSRFProtect(app)
 
 
 def get_user_db():
@@ -424,8 +425,7 @@ def download_receipt(order_id):
     lines=[f"Receipt - Order #{order_id}",f"Date: {order['created_at']}",f"Status: {order['status']}",f"Shipping: {order['shipping_address']}",'Items:']
     lines.extend(f"  {item['title']} x{item['quantity']} @ ${item['price']:.2f}" for item in items)
     lines.append(f"Total: ${order['total']:.2f}")
-    response=make_response('\n'.join(lines))
-    response.mimetype='text/plain'
+    response=Response('\n'.join(lines),mimetype='text/plain')
     response.headers['Content-Disposition']=f'attachment; filename=receipt_{order_id}.txt'
     return response
 

@@ -385,5 +385,21 @@ class ShopTests(unittest.TestCase):
         self.sql('UPDATE users SET reset_token_expiry=0 WHERE id=?',(aid,))
         self.assertEqual(self.b.get(link).status_code,400)
 
+    def test_tls_validation_and_transaction_cancellation(self):
+        from file_network import PinnedHTTPSConnection
+        import ssl
+        connection=PinnedHTTPSConnection('allowed.example','93.184.216.34')
+        self.assertTrue(connection._context.check_hostname)
+        self.assertEqual(connection._context.verify_mode,ssl.CERT_REQUIRED)
+        connection.close()
+        from storage import transaction
+        with self.assertRaises(KeyboardInterrupt):
+            with transaction(self.db) as db:
+                db.execute('UPDATE users SET balance_cents=0 WHERE id=1')
+                raise KeyboardInterrupt('test cancellation')
+        self.assertEqual(self.sql('SELECT balance_cents FROM users WHERE id=1')[0]['balance_cents'],100000)
+        for value in ['bad address@example.invalid','two@@example.invalid','no-domain','a@.invalid']:
+            self.assertEqual(self.post(self.a,'/register',dict(username='qa_test',email=value,password=self.password,confirm_password=self.password)).status_code,400)
+
 
 if __name__=='__main__': unittest.main()

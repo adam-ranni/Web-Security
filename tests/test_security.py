@@ -160,5 +160,63 @@ class ShopTests(unittest.TestCase):
         self.sql('UPDATE users SET auth_version=auth_version+1 WHERE username=?',('qa_alice',))
         self.assertEqual(self.a.get('/api/jwt/me',headers=headers).status_code,401)
 
+    def test_avatar_content_and_private_delivery(self):
+        from PIL import Image
+        aid=self.register(self.a,'qa_alice');self.register(self.b,'qa_bob')
+        image=io.BytesIO();Image.new('RGB',(2,2)).save(image,format='PNG');image.seek(0)
+        response=self.post(self.a,'/upload_avatar',{'avatar':(image,'../../avatar.png')})
+        self.assertEqual(response.status_code,302)
+        filename=self.sql('SELECT profile_pic FROM users WHERE id=?',(aid,))[0]['profile_pic']
+        self.assertRegex(filename,r'^[0-9a-f]{32}\.png$')
+        response=self.a.get('/media/'+filename)
+        self.assertEqual(response.status_code,200);response.close()
+        self.assertEqual(self.b.get('/media/'+filename).status_code,404)
+        self.assertEqual(self.a.get('/static/uploads/'+filename).status_code,404)
+        self.assertEqual(self.post(self.a,'/upload_avatar',{'avatar':(io.BytesIO(b'not an image'),'wrong.png')}).status_code,400)
+        self.assertEqual(len(self.sql('SELECT * FROM uploaded_files')),1)
+
+    def test_xml_import_and_csv(self):
+        self.login(self.a)
+        xml=b'<books><book><title>Normal import</title><author>Author</author><price>12.34</price></book></books>'
+        response=self.post(self.a,'/api/import_books',data=xml,content_type='application/xml')
+        self.assertEqual(response.status_code,200)
+        self.assertEqual(self.sql('SELECT price_cents FROM books WHERE title=?',('Normal import',))[0]['price_cents'],1234)
+        entity=b'<!DOCTYPE books [<!ENTITY x SYSTEM "file:///never-read">]><books><book><title>&x;</title></book></books>'
+        self.assertEqual(self.post(self.a,'/api/import_books',data=entity,content_type='application/xml').status_code,400)
+        invalid=b'<books><book><title>Partial</title><author>A</author><price>1</price></book><book><price>NaN</price></book></books>'
+        self.assertEqual(self.post(self.a,'/api/import_books',data=invalid,content_type='application/xml').status_code,400)
+        self.assertFalse(self.sql('SELECT id FROM books WHERE title=?',('Partial',)))
+        self.sql('INSERT INTO books (title,author,price_cents) VALUES (?,?,?)',('=1+1','Comma, author',100))
+        response=self.a.get('/admin/export?format=csv')
+        import csv
+        exported=list(csv.DictReader(io.StringIO(response.get_data(as_text=True))))
+        self.assertEqual(exported[-1]['title'],"'=1+1")
+        self.assertEqual(exported[-1]['author'],'Comma, author')
+        self.assertEqual(self.a.get('/admin/export?format=other').status_code,400)
+
+    def test_network_boundaries_with_mocks(self):
+        import file_network
+        from unittest.mock import Mock
+        with patch('file_network.subprocess.run') as run,patch('file_network.shutil.which',return_value='/trusted/ping'):
+            run.return_value.stdout='two replies'
+            with self.assertRaises(ValueError): file_network.ping_host('127.0.0.1; arbitrary')
+            run.assert_not_called()
+            self.assertEqual(file_network.ping_host('127.0.0.1'),'two replies')
+            self.assertIsInstance(run.call_args.args[0],list)
+            self.assertFalse(run.call_args.kwargs.get('shell',False))
+        with patch.dict(os.environ,{'BOOKSHOP_PREVIEW_HOSTS':'allowed.example'}),patch('file_network.socket.getaddrinfo') as dns,patch('file_network.PinnedHTTPSConnection') as transport:
+            dns.return_value=[(2,1,6,'',('127.0.0.1',443))]
+            with self.assertRaises(ValueError): file_network.preview_url('https://allowed.example/')
+            transport.assert_not_called()
+            for url in ['http://allowed.example/','https://other.example/','https://user:pass@allowed.example/','https://allowed.example:444/']:
+                with self.assertRaises(ValueError): file_network.preview_url(url)
+            dns.return_value=[(2,1,6,'',('93.184.216.34',443))]
+            response=Mock(status=200);response.getheader.return_value='text/plain';response.read.return_value=b'Normal preview'
+            transport.return_value.getresponse.return_value=response
+            self.assertEqual(file_network.preview_url('https://allowed.example/'),'Normal preview')
+            transport.assert_called_with('allowed.example','93.184.216.34')
+            response.status=302
+            with self.assertRaises(ValueError): file_network.preview_url('https://allowed.example/')
+
 
 if __name__=='__main__': unittest.main()

@@ -15,7 +15,7 @@
                     <!-- Profile Picture (B5: XSS via filename with ) -->
                     <div class="profile-pic-wrapper mb-3">
                         {% if user['profile_pic'] %}
-                            <img src="/static/uploads/{{ user['profile_pic'] }}" alt="Profile" class="profile-pic">
+                            <img src="{{ avatar_url(user) }}" alt="Profile" class="profile-pic">
                             <div class="profile-pic-name">{{ user['profile_pic'] }}</div>
                         {% else %}
                             <div class="profile-pic-placeholder">

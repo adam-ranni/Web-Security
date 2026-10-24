@@ -1,0 +1,2 @@
+{% extends 'base.html' %}
+{% block content %}<h1>Your uploads</h1><ul>{% for file in files %}<li><a href="{{ url_for('avatar',filename=file['filename']) }}">{{ file['original_filename'] }}</a></li>{% endfor %}</ul>{% endblock %}

@@ -12,12 +12,15 @@ from pathlib import Path
 
 import click
 import jwt
-from flask import Flask, abort, flash, g, jsonify, make_response, redirect, render_template, request, session, url_for
+from flask import send_from_directory, Flask, abort, flash, g, jsonify, make_response, redirect, render_template, request, session, url_for
 from flask_wtf.csrf import CSRFError, generate_csrf
 from werkzeug.exceptions import HTTPException
 from werkzeug.security import generate_password_hash
 
 from catalog_seed import BOOKS, COUPONS
+from file_network import parse_books, ping_host, preview_url, store_avatar
+from defusedxml.common import DefusedXmlException
+from xml.etree.ElementTree import ParseError
 from storage import cents, initialize, mask_card, migrate, transaction
 from shop_security import (admin_required, authenticate, configure, current_password,
     database, digest, email, end_session, login_required, one, positive_int,
@@ -294,41 +297,23 @@ def delete_account():
     return redirect(url_for('index'))
 
 
-@app.route('/upload_avatar', methods=['POST'])
+@app.post('/upload_avatar')
 @login_required
 def upload_avatar():
-    if 'avatar' not in request.files:
-        flash('No file selected.', 'danger')
-        return redirect(url_for('edit_profile'))
-
-    file = request.files['avatar']
-    if file.filename == '':
-        flash('No file selected.', 'danger')
-        return redirect(url_for('edit_profile'))
-
-    # G1 вЂ” Unrestricted file upload: no extension/type validation
-    # G2 вЂ” Path traversal: filename used directly
-    # G3 вЂ” No MIME type validation
-    filename = file.filename  # No secure_filename!
-    filepath = os.path.join(UPLOAD_FOLDER, filename)
-    file.save(filepath)
-
-    # B5 вЂ” XSS via filename: original filename stored and rendered
-    conn = get_user_db()
-    c = conn.cursor()
-    c.execute('UPDATE users SET profile_pic = ? WHERE id = ?', (filename, session['user_id']))
-    conn.commit()
-
-    # Log uploaded file
-    sconn = get_shop_db()
-    sc = sconn.cursor()
-    sc.execute('INSERT INTO uploaded_files (user_id, filename, original_filename) VALUES (?, ?, ?)',
-              (session['user_id'], filename, file.filename))
-    sconn.commit()
-    sconn.close()
-
-    conn.close()
-    flash('Avatar uploaded successfully!', 'success')
+    upload=request.files.get('avatar')
+    if not upload or not upload.filename:
+        abort(400,description='Select an image')
+    try:
+        filename,original=store_avatar(upload,app.config['UPLOAD_FOLDER'])
+    except ValueError as error:
+        abort(400,description=str(error))
+    try:
+        with transaction(app.config['DATABASE']) as db:
+            db.execute('UPDATE users SET profile_pic=? WHERE id=?',(filename,g.user['id']))
+            db.execute('INSERT INTO uploaded_files (user_id,filename,original_filename) VALUES (?,?,?)',(g.user['id'],filename,original))
+    except BaseException:
+        (Path(app.config['UPLOAD_FOLDER'])/filename).unlink(missing_ok=True)
+        raise
     return redirect(url_for('profile'))
 
 
@@ -680,50 +665,22 @@ def api_update_role():
     return jsonify(success=True)
 
 
-@app.route('/api/import_books', methods=['POST'])
+@app.post('/api/import_books')
+@admin_required
 def api_import_books():
-    """L3 вЂ” XXE: XML External Entity injection via book import."""
-    if 'xml_file' not in request.files:
-        xml_data = request.data
-    else:
-        xml_data = request.files['xml_file'].read()
-
-    if not xml_data:
-        return jsonify({'error': 'No XML data provided'}), 400
-
+    data=request.files['xml_file'].read(1000001) if 'xml_file' in request.files else request.get_data()
     try:
-        # L3 вЂ” XXE vulnerable: parsing XML without disabling external
-        # entities. NOTE: stdlib xml.etree.ElementTree (expat) does NOT
-        # resolve external SYSTEM/PUBLIC entities, so this route was not
-        # actually exploitable for classic XXE (file read / SSRF) on any
-        # modern Python. We use lxml with resolve_entities=True instead,
-        # which DOES resolve <!ENTITY x SYSTEM "file://..."> references.
-        xxe_parser = etree.XMLParser(resolve_entities=True, no_network=False,
-                                      load_dtd=True, huge_tree=True)
-        root = etree.fromstring(xml_data, parser=xxe_parser)
-        books_added = 0
-
-        conn = get_shop_db()
-        c = conn.cursor()
-
-        for book_elem in root.findall('book'):
-            title = book_elem.findtext('title', '')
-            author = book_elem.findtext('author', '')
-            price = float(book_elem.findtext('price', '0'))
-            description = book_elem.findtext('description', '')
-            category = book_elem.findtext('category', 'General')
-
-            c.execute('''INSERT INTO books (title, author, price, description, category)
-                        VALUES (?, ?, ?, ?, ?)''',
-                     (title, author, price, description, category))
-            books_added += 1
-
-        conn.commit()
-        conn.close()
-
-        return jsonify({'success': True, 'books_added': books_added})
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        elements=parse_books(data)
+        values=[]
+        for element in elements:
+            if element.tag!='book':
+                abort(400)
+            values.append((text(element.findtext('title',''),200),text(element.findtext('author',''),200),cents(element.findtext('price','')),text(element.findtext('description',''),4000,required=False),text(element.findtext('category','General'),100)))
+        with transaction(app.config['DATABASE']) as db:
+            db.executemany('INSERT INTO books (title,author,price_cents,description,category) VALUES (?,?,?,?,?)',values)
+        return jsonify(success=True,books_added=len(values))
+    except (DefusedXmlException,ParseError,ValueError):
+        abort(400,description='Invalid book XML')
 
 
 @app.post('/api/load_cart')
@@ -875,82 +832,45 @@ def admin_reply_ticket(ticket_id):
     return redirect(url_for('admin_tickets'))
 
 
-@app.route('/admin/ping', methods=['GET', 'POST'])
+@app.route('/admin/ping',methods=['GET','POST'])
 @admin_required
 def admin_ping():
-    result = None
-    if request.method == 'POST':
-        host = request.form.get('host', '')
-
-        # H1 вЂ” OS Command Injection
+    result=None
+    if request.method=='POST':
         try:
-            output = subprocess.check_output(
-                f"ping -c 2 {host}",
-                shell=True,
-                stderr=subprocess.STDOUT,
-                timeout=10
-            )
-            result = output.decode('utf-8', errors='replace')
-        except subprocess.TimeoutExpired:
-            result = "Command timed out"
-        except subprocess.CalledProcessError as e:
-            result = e.output.decode('utf-8', errors='replace')
-        except Exception as e:
-            result = f"Error: {str(e)}"
-
-        log_admin_action(session['user_id'], 'ping', details=f'Host: {host}')
-
-    return render_template('admin_ping.html', result=result)
+            result=ping_host(text(request.form.get('host',''),64))
+        except (ValueError,OSError,TimeoutError):
+            result='Ping rejected or unavailable'
+        log_admin_action(g.user['id'],'ping')
+    return render_template('admin_ping.html',result=result)
 
 
-@app.route('/admin/preview_url', methods=['GET', 'POST'])
+@app.route('/admin/preview_url',methods=['GET','POST'])
 @admin_required
 def admin_preview_url():
-    content = None
-    if request.method == 'POST':
-        url = request.form.get('url', '')
-
-        # I1 вЂ” SSRF: No URL validation, fetches arbitrary URLs
+    content=None
+    if request.method=='POST':
         try:
-            response = urlopen(url, timeout=5)
-            content = response.read().decode('utf-8', errors='replace')[:5000]
-        except Exception as e:
-            content = f"Error fetching URL: {str(e)}"
-
-        log_admin_action(session['user_id'], 'preview_url', details=f'URL: {url}')
-
-    return render_template('admin_preview.html', content=content)
+            content=preview_url(text(request.form.get('url',''),2000))
+        except (ValueError,OSError,TimeoutError):
+            content='Preview rejected or unavailable'
+        log_admin_action(g.user['id'],'preview_url')
+    return render_template('admin_preview.html',content=content)
 
 
-@app.route('/admin/export')
+@app.get('/admin/export')
 @admin_required
 def admin_export():
-    fmt = request.args.get('format', 'csv')
-
-    # H2 вЂ” Command injection in export
-    try:
-        conn = get_shop_db()
-        c = conn.cursor()
-        c.execute('SELECT * FROM books')
-        books = c.fetchall()
-        conn.close()
-
-        if fmt == 'csv':
-            output = "id,title,author,price,category,stock\n"
-            for b in books:
-                output += f"{b['id']},{b['title']},{b['author']},{b['price']},{b['category']},{b['stock']}\n"
-
-            response = make_response(output)
-            response.headers['Content-Type'] = 'text/csv'
-            response.headers['Content-Disposition'] = 'attachment; filename=books.csv'
-            return response
-        else:
-            # Vulnerable: format parameter injected into shell command
-            cmd = f"echo 'Export format: {fmt}' && date"
-            result = subprocess.check_output(cmd, shell=True, stderr=subprocess.STDOUT, timeout=5)
-            return result.decode('utf-8', errors='replace')
-    except Exception as e:
-        return f"Export error: {str(e)}", 500
+    if request.args.get('format','csv')!='csv':
+        abort(400,description='Only CSV export is supported')
+    output=io.StringIO(newline=''); writer=csv.writer(output)
+    writer.writerow(['id','title','author','price','category','stock'])
+    for book in rows('SELECT * FROM books ORDER BY id'):
+        values=[book['id'],book['title'],book['author'],f"{book['price']:.2f}",book['category'],book['stock']]
+        writer.writerow(["'"+v if isinstance(v,str) and v.lstrip().startswith(('=','+','-','@','\t','\r')) else v for v in values])
+    response=make_response(output.getvalue()); response.mimetype='text/csv'
+    response.headers['Content-Disposition']='attachment; filename=books.csv'
+    return response
 
 
 @app.post('/admin/reset_data')
@@ -986,18 +906,11 @@ def robots():
     return response
 
 
-@app.route('/uploads')
+@app.get('/uploads')
+@login_required
 def list_uploads():
-    """J6 вЂ” Directory listing of uploaded files."""
-    try:
-        files = os.listdir(UPLOAD_FOLDER)
-        output = "<h2>Uploaded Files</h2><ul>"
-        for f in files:
-            output += f'<li><a href="/static/uploads/{f}">{f}</a></li>'
-        output += "</ul>"
-        return output
-    except Exception as e:
-        return f"Error: {str(e)}", 500
+    files=rows('SELECT filename,original_filename FROM uploaded_files WHERE user_id=? ORDER BY id',(g.user['id'],))
+    return render_template('uploads.html',files=files)
 
 
 @app.get('/app.py.bak')
@@ -1186,6 +1099,29 @@ def race_lab_safe_transfer():
 def race_lab_reset():
     abort(405)
 
+
+
+
+@app.get('/media/<filename>')
+@login_required
+def avatar(filename):
+    if not re.fullmatch(r'[0-9a-f]{32}\.png',filename):
+        abort(404)
+    uploaded=one('SELECT user_id FROM uploaded_files WHERE filename=?',(filename,))
+    if not uploaded or (uploaded['user_id']!=g.user['id'] and g.user['role']!='admin'):
+        abort(404)
+    return send_from_directory(app.config['UPLOAD_FOLDER'],filename,mimetype='image/png')
+
+
+def avatar_url(user):
+    if user['profile_pic']=='default.png':
+        return url_for('static',filename='uploads/default.png')
+    return url_for('avatar',filename=user['profile_pic'])
+
+
+@app.context_processor
+def avatar_context():
+    return dict(avatar_url=avatar_url)
 
 if __name__=='__main__':
     app.run(host='127.0.0.1',port=int(os.environ.get('BOOKSHOP_PORT','5006')),debug=False)

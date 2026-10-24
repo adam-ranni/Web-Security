@@ -16,12 +16,12 @@
                         <label for="current-edit_profile" class="form-label">Current password (required for account changes)</label><input id="current-edit_profile" type="password" name="current_password" autocomplete="current-password" class="form-control mb-3">
                         <div class="mb-3">
                             <label class="form-label text-muted">Email</label>
-                            <input type="email" name="email" class="form-control bg-dark text-light border-secondary" 
+                            <input type="email" name="email" class="form-control bg-dark text-light border-secondary"
                                    value="{{ user['email'] }}">
                         </div>
                         <div class="mb-3">
                             <label class="form-label text-muted">Bio</label>
-                            <textarea name="bio" rows="4" class="form-control bg-dark text-light border-secondary" 
+                            <textarea name="bio" rows="4" class="form-control bg-dark text-light border-secondary"
                                       placeholder="Tell us about yourself...">{{ user['bio'] }}</textarea>
                             <small class="text-muted">Plain text only</small>
                         </div>
@@ -41,7 +41,7 @@
                 </div>
                 <div class="card-body">
                     <div class="text-center mb-3">
-                        <img src="{{ url_for('static', filename='uploads/' + user['profile_pic']) }}" 
+                        <img src="{{ avatar_url(user) }}"
                              alt="Avatar" class="rounded-circle" style="width:100px;height:100px;object-fit:cover;border:2px solid rgba(0,255,65,0.3);">
                     </div>
                     <form action="{{ url_for('upload_avatar') }}" method="POST" enctype="multipart/form-data">

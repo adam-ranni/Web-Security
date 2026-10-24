@@ -218,5 +218,76 @@ class ShopTests(unittest.TestCase):
             response.status=302
             with self.assertRaises(ValueError): file_network.preview_url('https://allowed.example/')
 
+    def test_purchase_uses_server_price_and_coupon(self):
+        aid=self.register(self.a,'qa_alice')
+        self.assertEqual(self.post(self.a,'/add_to_cart/1',dict(quantity=2)).status_code,302)
+        self.assertEqual(self.post(self.a,'/apply_coupon',dict(code='HACK10')).status_code,302)
+        self.assertEqual(self.a.get('/checkout').status_code,200)
+        response=self.post(self.a,'/checkout',dict(total='0.01',shipping_address='Test classroom'))
+        self.assertEqual(response.status_code,302)
+        order=self.sql('SELECT * FROM orders')[0]
+        self.assertEqual(order['total_cents'],5398)
+        self.assertEqual(self.sql('SELECT balance_cents FROM users WHERE id=?',(aid,))[0]['balance_cents'],94602)
+        self.assertEqual(self.sql('SELECT stock FROM books WHERE id=1')[0]['stock'],48)
+        self.assertEqual(self.sql('SELECT current_uses FROM coupons WHERE code=?',('HACK10',))[0]['current_uses'],1)
+        self.assertFalse(self.sql('SELECT * FROM cart'))
+        receipt=self.a.get('/download_receipt/'+str(order['id']))
+        self.assertIn(b'$53.98',receipt.data)
+        self.assertIn(('/order/'+str(order['id'])).encode(),self.a.get('/order_history').data)
+        self.assertEqual(self.post(self.a,'/checkout',dict(shipping_address='Repeat')).status_code,409)
+        self.assertEqual(len(self.sql('SELECT * FROM orders')),1)
+
+    def test_checkout_rolls_back_all_writes(self):
+        aid=self.register(self.a,'qa_alice')
+        self.post(self.a,'/add_to_cart/1',dict(quantity=1))
+        self.sql("CREATE TRIGGER reject_order BEFORE INSERT ON orders BEGIN SELECT RAISE(ABORT,'fixture'); END")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.post(self.a,'/checkout',dict(shipping_address='Test classroom'))
+        self.assertEqual(self.sql('SELECT balance_cents FROM users WHERE id=?',(aid,))[0]['balance_cents'],100000)
+        self.assertEqual(self.sql('SELECT stock FROM books WHERE id=1')[0]['stock'],50)
+        self.assertEqual(len(self.sql('SELECT * FROM cart')),1)
+        self.assertFalse(self.sql('SELECT * FROM orders'))
+
+    def test_quantities_balances_and_coupon_exhaustion(self):
+        aid=self.register(self.a,'qa_alice');self.register(self.b,'qa_bob')
+        for value in ['-1','0','101','1.5','NaN']:
+            self.assertEqual(self.post(self.a,'/add_to_cart/1',dict(quantity=value)).status_code,400)
+        for value in ['NaN','inf','-1','0','1.001']:
+            self.assertEqual(self.post(self.a,'/transfer',dict(recipient='qa_bob',amount=value)).status_code,409)
+        self.assertEqual(self.post(self.a,'/transfer',dict(recipient='qa_bob',amount='25.01')).status_code,302)
+        self.assertEqual(self.sql('SELECT balance_cents FROM users WHERE id=?',(aid,))[0]['balance_cents'],97499)
+        self.assertEqual(sum(row['balance_cents'] for row in self.sql('SELECT balance_cents FROM users WHERE username IN (?,?)',('qa_alice','qa_bob'))),200000)
+        self.sql('UPDATE coupons SET max_uses=1 WHERE code=?',('HACK10',))
+        for client in [self.a,self.b]:
+            self.post(client,'/add_to_cart/1',dict(quantity=1));self.post(client,'/apply_coupon',dict(code='HACK10'))
+        self.assertEqual(self.post(self.a,'/checkout',dict(shipping_address='Test')).status_code,302)
+        self.assertEqual(self.post(self.b,'/checkout',dict(shipping_address='Test')).status_code,409)
+        self.assertEqual(len(self.sql('SELECT * FROM orders')),1)
+        self.assertEqual(self.sql('SELECT current_uses FROM coupons WHERE code=?',('HACK10',))[0]['current_uses'],1)
+
+    def test_parallel_checkout_creates_one_order(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Barrier
+        aid=self.register(self.a,'qa_alice')
+        self.post(self.a,'/add_to_cart/1',dict(quantity=1))
+        barrier=Barrier(2)
+        def checkout(_):
+            client=shop.app.test_client();self.login(client,'qa_alice');token=self.token(client)
+            barrier.wait(timeout=10)
+            return client.post('/checkout',data=dict(shipping_address='Concurrent test'),headers={'X-CSRFToken':token}).status_code
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            statuses=list(pool.map(checkout,range(2)))
+        self.assertEqual(sorted(statuses),[302,409])
+        self.assertEqual(len(self.sql('SELECT * FROM orders')),1)
+        self.assertEqual(self.sql('SELECT balance_cents FROM users WHERE id=?',(aid,))[0]['balance_cents'],97001)
+
+    def test_old_lab_paths_cannot_restore_vulnerable_transactions(self):
+        self.register(self.a,'alice_hacker')
+        endpoint='/api/race-lab/transfer/vulnerable'
+        self.assertEqual(self.post(self.a,endpoint,json=dict(recipient='bob_secure',amount='75')).status_code,200)
+        self.assertEqual(self.post(self.a,endpoint,json=dict(recipient='bob_secure',amount='75')).status_code,409)
+        self.assertEqual(self.sql('SELECT balance_cents FROM race_accounts WHERE username=?',('alice_hacker',))[0]['balance_cents'],2500)
+        self.assertEqual(self.post(self.a,'/lab',dict(secure='')).status_code,405)
+
 
 if __name__=='__main__': unittest.main()

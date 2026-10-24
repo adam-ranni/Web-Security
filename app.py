@@ -18,6 +18,7 @@ from werkzeug.exceptions import HTTPException
 from werkzeug.security import generate_password_hash
 
 from catalog_seed import BOOKS, COUPONS
+from commerce import purchase, quote_cart, transfer, transfer_cents
 from file_network import parse_books, ping_host, preview_url, store_avatar
 from defusedxml.common import DefusedXmlException
 from xml.etree.ElementTree import ParseError
@@ -317,174 +318,75 @@ def upload_avatar():
     return redirect(url_for('profile'))
 
 
-@app.route('/add_to_cart/<int:book_id>', methods=['POST'])
+@app.post('/add_to_cart/<int:book_id>')
 @login_required
 def add_to_cart(book_id):
-    # C3 вЂ” CSRF: No token validation
-    # K1 вЂ” Negative quantity: accepts any quantity value
-    quantity = request.form.get('quantity', 1, type=int)
-
-    conn = get_shop_db()
-    c = conn.cursor()
-
-    c.execute('SELECT * FROM books WHERE id = ?', (book_id,))
-    book = c.fetchone()
-    if not book:
-        conn.close()
-        flash('Book not found.', 'danger')
-        return redirect(url_for('index'))
-
-    c.execute('SELECT * FROM cart WHERE user_id = ? AND book_id = ?',
-              (session['user_id'], book_id))
-    cart_item = c.fetchone()
-
-    if cart_item:
-        c.execute('UPDATE cart SET quantity = quantity + ? WHERE user_id = ? AND book_id = ?',
-                 (quantity, session['user_id'], book_id))
-    else:
-        c.execute('INSERT INTO cart (user_id, book_id, quantity) VALUES (?, ?, ?)',
-                 (session['user_id'], book_id, quantity))
-
-    conn.commit()
-    conn.close()
-
-    flash('Book added to cart!', 'success')
-    return redirect(request.referrer or url_for('index'))
-
-
-@app.route('/cart')
-@login_required
-def view_cart():
-    conn = get_shop_db()
-    c = conn.cursor()
-    c.execute('''SELECT books.*, cart.quantity, cart.id as cart_id
-                 FROM cart
-                 JOIN books ON cart.book_id = books.id
-                 WHERE cart.user_id = ?''', (session['user_id'],))
-    cart_items = c.fetchall()
-    total = sum(item['price'] * item['quantity'] for item in cart_items)
-    conn.close()
-    return render_template('cart.html', cart_items=cart_items, total=total)
-
-
-@app.route('/remove_from_cart/<int:book_id>', methods=['POST'])
-@login_required
-def remove_from_cart(book_id):
-    conn = get_shop_db()
-    c = conn.cursor()
-    c.execute('DELETE FROM cart WHERE user_id = ? AND book_id = ?',
-              (session['user_id'], book_id))
-    conn.commit()
-    conn.close()
-    flash('Item removed from cart.', 'success')
+    quantity=positive_int(request.form.get('quantity','1'))
+    with transaction(app.config['DATABASE']) as db:
+        book=db.execute('SELECT stock FROM books WHERE id=?',(book_id,)).fetchone()
+        if not book:
+            abort(404)
+        old=db.execute('SELECT quantity FROM cart WHERE user_id=? AND book_id=?',(g.user['id'],book_id)).fetchone()
+        combined=quantity+(old['quantity'] if old else 0)
+        if combined>100 or combined>book['stock']:
+            abort(409,description='Quantity exceeds available stock')
+        db.execute('INSERT INTO cart (user_id,book_id,quantity) VALUES (?,?,?) ON CONFLICT(user_id,book_id) DO UPDATE SET quantity=excluded.quantity',(g.user['id'],book_id,combined))
     return redirect(url_for('view_cart'))
 
 
-@app.route('/checkout', methods=['GET', 'POST'])
+@app.get('/cart')
+@login_required
+def view_cart():
+    items=rows('SELECT books.*,cart.quantity,cart.id AS cart_id FROM cart JOIN books ON books.id=cart.book_id WHERE cart.user_id=? ORDER BY books.id',(g.user['id'],))
+    total=sum(item['price_cents']*item['quantity'] for item in items)/100
+    return render_template('cart.html',cart_items=items,total=total)
+
+
+@app.post('/remove_from_cart/<int:book_id>')
+@login_required
+def remove_from_cart(book_id):
+    write('DELETE FROM cart WHERE user_id=? AND book_id=?',(g.user['id'],book_id))
+    return redirect(url_for('view_cart'))
+
+
+@app.route('/checkout',methods=['GET','POST'])
 @login_required
 def checkout():
-    conn = get_shop_db()
-    c = conn.cursor()
-    c.execute('''SELECT books.*, cart.quantity
-                 FROM cart
-                 JOIN books ON cart.book_id = books.id
-                 WHERE cart.user_id = ?''', (session['user_id'],))
-    cart_items = c.fetchall()
-
-    if not cart_items:
-        conn.close()
-        flash('Your cart is empty.', 'danger')
-        return redirect(url_for('view_cart'))
-
-    total = sum(item['price'] * item['quantity'] for item in cart_items)
-
-    if request.method == 'POST':
-        shipping_address = request.form.get('shipping_address', '')
-        # K3 вЂ” Price manipulation: uses client-submitted total instead of server-calculated
-        submitted_total = request.form.get('total', total, type=float)
-
-        uconn = get_user_db()
-        uc = uconn.cursor()
-        uc.execute('SELECT balance FROM users WHERE id = ?', (session['user_id'],))
-        user = uc.fetchone()
-
-        # K5 вЂ” Insufficient balance bypass: uses submitted_total
-        if user['balance'] < submitted_total:
-            uconn.close()
-            conn.close()
-            flash('Insufficient balance!', 'danger')
-            return redirect(url_for('checkout'))
-
-        # Deduct balance
-        uc.execute('UPDATE users SET balance = balance - ? WHERE id = ?',
-                  (submitted_total, session['user_id']))
-        uconn.commit()
-        uconn.close()
-
-        # Create order
-        c.execute('''INSERT INTO orders (user_id, total, status, shipping_address)
-                     VALUES (?, ?, 'confirmed', ?)''',
-                 (session['user_id'], submitted_total, shipping_address))
-        order_id = c.lastrowid
-
-        # Create order items
-        for item in cart_items:
-            c.execute('''INSERT INTO order_items (order_id, book_id, quantity, price)
-                        VALUES (?, ?, ?, ?)''',
-                     (order_id, item['id'], item['quantity'], item['price']))
-
-        # Clear cart
-        c.execute('DELETE FROM cart WHERE user_id = ?', (session['user_id'],))
-        conn.commit()
-        conn.close()
-
-        flash(f'Order #{order_id} placed successfully!', 'success')
-        return redirect(url_for('order_detail', order_id=order_id))
-
-    conn.close()
-
-    # Get user balance
-    uconn = get_user_db()
-    uc = uconn.cursor()
-    uc.execute('SELECT * FROM users WHERE id = ?', (session['user_id'],))
-    user = uc.fetchone()
-    uconn.close()
-
-    return render_template('checkout.html', cart_items=cart_items, total=total, user=user)
+    try:
+        if request.method=='POST':
+            address=text(request.form.get('shipping_address',''),500)
+            order_id=purchase(app.config['DATABASE'],g.user['id'],session.get('coupon_code'),address)
+            session.pop('coupon_code',None);session.pop('coupon_discount',None)
+            return redirect(url_for('order_detail',order_id=order_id))
+        with closing(database()) as db:
+            items,subtotal,total,coupon=quote_cart(db,g.user['id'],session.get('coupon_code'))
+        if coupon:
+            session['coupon_discount']=coupon['discount_percent']
+        return render_template('checkout.html',cart_items=items,total=total/100,subtotal=subtotal/100,user=g.user)
+    except ValueError as error:
+        if request.method=='GET' and not one('SELECT id FROM cart WHERE user_id=?',(g.user['id'],)):
+            return redirect(url_for('view_cart'))
+        abort(409,description=str(error))
 
 
-@app.route('/apply_coupon', methods=['POST'])
+@app.post('/apply_coupon')
 @login_required
 def apply_coupon():
-    code = request.form.get('code', '')
-
-    conn = get_shop_db()
-    c = conn.cursor()
-    c.execute('SELECT * FROM coupons WHERE code = ? AND is_active = 1', (code,))
-    coupon = c.fetchone()
-
-    if coupon:
-        # K4 вЂ” Coupon reuse: max_uses not properly enforced
-        session['coupon_discount'] = coupon['discount_percent']
-        session['coupon_code'] = code
-        flash(f'Coupon applied! {coupon["discount_percent"]}% discount.', 'success')
-    else:
-        flash('Invalid or expired coupon code.', 'danger')
-
-    conn.close()
+    code=text(request.form.get('code',''),64)
+    coupon=one('SELECT * FROM coupons WHERE code=? AND is_active=1 AND current_uses<max_uses',(code,))
+    if not coupon:
+        session.pop('coupon_code',None);session.pop('coupon_discount',None)
+        abort(400,description='Invalid or exhausted coupon')
+    session['coupon_code']=coupon['code']
+    session['coupon_discount']=coupon['discount_percent']
     return redirect(url_for('checkout'))
 
 
-@app.route('/order_history')
+@app.get('/order_history')
 @login_required
 def order_history():
-    conn = get_shop_db()
-    c = conn.cursor()
-    c.execute('SELECT * FROM orders WHERE user_id = ? ORDER BY created_at DESC',
-              (session['user_id'],))
-    orders = c.fetchall()
-    conn.close()
-    return render_template('order_history.html', orders=orders)
+    orders=rows('SELECT * FROM orders WHERE user_id=? ORDER BY created_at DESC,id DESC',(g.user['id'],))
+    return render_template('order_history.html',orders=orders)
 
 
 @app.get('/order/<int:order_id>')
@@ -536,63 +438,18 @@ def delete_review(review_id):
     return redirect(url_for('book_details',id=review['book_id']))
 
 
-@app.route('/transfer', methods=['GET', 'POST'])
+@app.route('/transfer',methods=['GET','POST'])
 @login_required
 def transfer_balance():
-    if request.method == 'POST':
-        # C4 вЂ” CSRF: No token validation for money transfer
-        recipient_username = request.form.get('recipient', '')
-        amount = request.form.get('amount', 0, type=float)
-
-        if amount <= 0:
-            flash('Invalid amount.', 'danger')
-            return redirect(url_for('transfer_balance'))
-
-        conn = get_user_db()
-        c = conn.cursor()
-
-        # Check sender balance
-        c.execute('SELECT * FROM users WHERE id = ?', (session['user_id'],))
-        sender = c.fetchone()
-
-        if sender['balance'] < amount:
-            flash('Insufficient balance.', 'danger')
-            conn.close()
-            return redirect(url_for('transfer_balance'))
-
-        # Find recipient
-        c.execute('SELECT * FROM users WHERE username = ?', (recipient_username,))
-        recipient = c.fetchone()
-
-        if not recipient:
-            flash('Recipient not found.', 'danger')
-            conn.close()
-            return redirect(url_for('transfer_balance'))
-
-        if recipient['id'] == session['user_id']:
-            flash('Cannot transfer to yourself.', 'danger')
-            conn.close()
-            return redirect(url_for('transfer_balance'))
-
-        # K2 вЂ” Race condition: no locking, vulnerable to double-spend
-        c.execute('UPDATE users SET balance = balance - ? WHERE id = ?',
-                 (amount, session['user_id']))
-        c.execute('UPDATE users SET balance = balance + ? WHERE id = ?',
-                 (amount, recipient['id']))
-        conn.commit()
-        conn.close()
-
-        flash(f'${amount:.2f} transferred to {recipient_username}!', 'success')
+    if request.method=='POST':
+        try:
+            amount=transfer_cents(request.form.get('amount',''))
+            recipient=text(request.form.get('recipient',''),32)
+            transfer(app.config['DATABASE'],g.user['id'],recipient,amount)
+        except ValueError as error:
+            abort(409,description=str(error))
         return redirect(url_for('profile'))
-
-    # GET вЂ” show transfer form
-    conn = get_user_db()
-    c = conn.cursor()
-    c.execute('SELECT * FROM users WHERE id = ?', (session['user_id'],))
-    user = c.fetchone()
-    conn.close()
-
-    return render_template('transfer.html', user=user)
+    return render_template('transfer.html',user=g.user)
 
 
 @app.route('/support')
@@ -964,134 +821,47 @@ def jwt_admin():
     return jsonify(message='Welcome, admin.')
 
 
-@app.route('/api/race-lab/status')
+@app.get('/api/race-lab/status')
 @login_required
 def race_lab_status():
-    """Show balances and transfer records from the isolated race lab."""
-    if not _race_lab_user():
-        return jsonify({'error': 'Use alice_hacker or bob_secure for the race lab'}), 403
-
-    conn = get_race_db()
-    accounts = [dict(row) for row in conn.execute(
-        'SELECT username, balance FROM race_accounts ORDER BY id'
-    ).fetchall()]
-    transfers = [dict(row) for row in conn.execute(
-        'SELECT sender, recipient, amount, mode, created_at '
-        'FROM race_transfers ORDER BY id DESC LIMIT 20'
-    ).fetchall()]
-    conn.close()
-    return jsonify({'accounts': accounts, 'recent_transfers': transfers})
+    if g.user['username'] not in {'alice_hacker','bob_secure'} and g.user['role']!='admin':
+        abort(403)
+    accounts=[dict(row) for row in rows('SELECT username,balance FROM race_accounts ORDER BY id')]
+    transfers=[dict(row) for row in rows('SELECT sender,recipient,amount,mode,created_at FROM race_transfers ORDER BY id DESC LIMIT 20')]
+    return jsonify(accounts=accounts,recent_transfers=transfers)
 
 
-@app.route('/api/race-lab/transfer/vulnerable', methods=['POST'])
+@app.post('/api/race-lab/transfer/vulnerable')
 @login_required
 def race_lab_vulnerable_transfer():
-    """Intentionally expose a check-then-act race in an isolated database."""
-    sender = _race_lab_user()
-    values = _race_transfer_input()
-    if not sender:
-        return jsonify({'error': 'Use alice_hacker or bob_secure for the race lab'}), 403
-    if not values:
-        return jsonify({'error': 'Send a positive amount and recipient'}), 400
-
-    amount, recipient = values
-    conn = get_race_db()
-    c = conn.cursor()
-    c.execute('SELECT balance FROM race_accounts WHERE username = ?', (sender,))
-    sender_row = c.fetchone()
-    c.execute('SELECT username FROM race_accounts WHERE username = ?', (recipient,))
-    recipient_row = c.fetchone()
-
-    if not sender_row or not recipient_row:
-        conn.close()
-        return jsonify({'error': 'Race-lab account not found'}), 404
-    if sender == recipient:
-        conn.close()
-        return jsonify({'error': 'Sender and recipient must be different'}), 400
-    if sender_row['balance'] < amount:
-        conn.close()
-        return jsonify({'error': 'Insufficient balance', 'balance': sender_row['balance']}), 409
-
-    # The deliberate pause makes two requests pass the same balance check.
-    time.sleep(0.1)
-    c.execute(
-        'UPDATE race_accounts SET balance = balance - ? WHERE username = ?',
-        (amount, sender),
-    )
-    c.execute(
-        'UPDATE race_accounts SET balance = balance + ? WHERE username = ?',
-        (amount, recipient),
-    )
-    c.execute(
-        'INSERT INTO race_transfers (sender, recipient, amount, mode) VALUES (?, ?, ?, ?)',
-        (sender, recipient, amount, 'vulnerable'),
-    )
-    conn.commit()
-    c.execute('SELECT balance FROM race_accounts WHERE username = ?', (sender,))
-    balance = c.fetchone()['balance']
-    conn.close()
-    return jsonify({
-        'status': 'accepted',
-        'mode': 'vulnerable',
-        'sender': sender,
-        'recipient': recipient,
-        'amount': amount,
-        'sender_balance': balance,
-    }), 200
+    # Retain the URL contract, but never expose a vulnerable transaction.
+    return race_lab_safe_transfer()
 
 
-@app.route('/api/race-lab/transfer/safe', methods=['POST'])
+@app.post('/api/race-lab/transfer/safe')
 @login_required
 def race_lab_safe_transfer():
-    """Use one SQLite transaction to close the race-condition window."""
-    sender = _race_lab_user()
-    values = _race_transfer_input()
-    if not sender:
-        return jsonify({'error': 'Use alice_hacker or bob_secure for the race lab'}), 403
-    if not values:
-        return jsonify({'error': 'Send a positive amount and recipient'}), 400
-
-    amount, recipient = values
-    conn = get_race_db()
-    c = conn.cursor()
+    sender=g.user['username']
+    if sender not in {'alice_hacker','bob_secure'}:
+        abort(403)
+    data=request.get_json(silent=True) or request.form
+    if not hasattr(data,'get'):
+        abort(400)
     try:
-        # Serialize the check and both balance updates for this SQLite database.
-        c.execute('BEGIN IMMEDIATE')
-        c.execute(
-            'UPDATE race_accounts SET balance = balance - ? '
-            'WHERE username = ? AND balance >= ?',
-            (amount, sender, amount),
-        )
-        if c.rowcount != 1:
-            conn.rollback()
-            return jsonify({'error': 'Insufficient balance or transfer rejected'}), 409
-
-        c.execute('SELECT username FROM race_accounts WHERE username = ?', (recipient,))
-        if not c.fetchone() or sender == recipient:
-            conn.rollback()
-            return jsonify({'error': 'Invalid recipient'}), 400
-
-        c.execute(
-            'UPDATE race_accounts SET balance = balance + ? WHERE username = ?',
-            (amount, recipient),
-        )
-        c.execute(
-            'INSERT INTO race_transfers (sender, recipient, amount, mode) VALUES (?, ?, ?, ?)',
-            (sender, recipient, amount, 'safe'),
-        )
-        conn.commit()
-        c.execute('SELECT balance FROM race_accounts WHERE username = ?', (sender,))
-        balance = c.fetchone()['balance']
-        return jsonify({
-            'status': 'accepted',
-            'mode': 'safe',
-            'sender': sender,
-            'recipient': recipient,
-            'amount': amount,
-            'sender_balance': balance,
-        }), 200
-    finally:
-        conn.close()
+        amount=transfer_cents(data.get('amount',''))
+        recipient=text(data.get('recipient',''),32)
+        with transaction(app.config['DATABASE']) as db:
+            if recipient not in {'alice_hacker','bob_secure'} or recipient==sender:
+                abort(400)
+            if db.execute('UPDATE race_accounts SET balance_cents=balance_cents-? WHERE username=? AND balance_cents>=?',(amount,sender,amount)).rowcount!=1:
+                abort(409)
+            if db.execute('UPDATE race_accounts SET balance_cents=balance_cents+? WHERE username=? AND balance_cents<=?',(amount,recipient,1000000000-amount)).rowcount!=1:
+                abort(409)
+            db.execute('INSERT INTO race_transfers (sender,recipient,amount_cents,mode) VALUES (?,?,?,?)',(sender,recipient,amount,'safe'))
+            balance=db.execute('SELECT balance FROM race_accounts WHERE username=?',(sender,)).fetchone()['balance']
+        return jsonify(status='accepted',mode='safe',sender_balance=balance)
+    except ValueError:
+        abort(400,description='Invalid transfer amount')
 
 
 @app.post('/api/race-lab/reset')

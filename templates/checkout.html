@@ -100,12 +100,12 @@
                     <div class="mb-3">
                         <div class="d-flex justify-content-between">
                             <span class="text-muted">Subtotal</span>
-                            <span>${{ "%.2f"|format(total) }}</span>
+                            <span>${{ "%.2f"|format(subtotal) }}</span>
                         </div>
                         {% if session.get('coupon_discount') %}
                         <div class="d-flex justify-content-between text-success">
                             <span>Discount ({{ session.get('coupon_discount') }}%)</span>
-                            <span>-${{ "%.2f"|format(total * session.get('coupon_discount', 0) / 100) }}</span>
+                            <span>-${{ "%.2f"|format(subtotal - total) }}</span>
                         </div>
                         {% endif %}
                         <hr style="border-color:rgba(0,255,65,0.2);">
@@ -117,8 +117,7 @@
 
                     <form action="{{ url_for('checkout') }}" method="POST" id="checkout-form">
 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-                        <!-- K3: Price manipulation — hidden total field -->
-                        <input type="hidden" name="total" value="{{ total }}">
+                        <!-- Server-calculated price — hidden total field -->
                         <button type="submit" class="btn btn-success w-100 btn-lg">
                             <i class="fas fa-lock me-2"></i>Place Order
                         </button>

@@ -401,5 +401,13 @@ class ShopTests(unittest.TestCase):
         for value in ['bad address@example.invalid','two@@example.invalid','no-domain','a@.invalid']:
             self.assertEqual(self.post(self.a,'/register',dict(username='qa_test',email=value,password=self.password,confirm_password=self.password)).status_code,400)
 
+    def test_relogin_rotates_and_revokes_previous_session(self):
+        self.register(self.a,'qa_alice')
+        with self.a.session_transaction() as state: old_sid=state['sid']
+        self.login(self.a,'qa_alice')
+        with self.a.session_transaction() as state: new_sid=state['sid']
+        self.assertNotEqual(old_sid,new_sid)
+        self.assertFalse(self.sql('SELECT * FROM sessions WHERE token_hash=?',(hashlib.sha256(old_sid.encode()).hexdigest(),)))
+
 
 if __name__=='__main__': unittest.main()

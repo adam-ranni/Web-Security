@@ -201,6 +201,8 @@ def authenticate(username,password):
 
 
 def start_session(user):
+    if session.get('sid'):
+        write('DELETE FROM sessions WHERE token_hash=?',(digest(session['sid']),))
     sid=secrets.token_urlsafe(32)
     session.clear()
     session.permanent=True

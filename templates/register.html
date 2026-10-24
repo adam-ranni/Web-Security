@@ -20,7 +20,7 @@
                 </div>
 
                 <!-- Registration Form -->
-                <form action="/register" method="POST">
+                <form action="/register" method="POST" id="register-form">
                     <!-- Account Info -->
                     <div class="form-section">
                         <h6 class="form-section-title">
@@ -31,7 +31,8 @@
                             <label for="username" class="form-label-cyber">Username</label>
                             <input type="text" name="username" id="username"
                                    class="form-control form-control-cyber"
-                                   placeholder="Choose a username" required autocomplete="username">
+                                   placeholder="Choose a username" required autocomplete="username" aria-describedby="username-feedback">
+                            <div id="username-feedback" class="mt-2 small" aria-live="polite"></div>
                         </div>
 
                         <div class="mb-3">

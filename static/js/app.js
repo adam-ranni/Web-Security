@@ -61,7 +61,7 @@ document.addEventListener('DOMContentLoaded', function() {
     }
 
     // Username availability check (triggers blind SQLi endpoint)
-    var usernameInput = document.getElementById('reg-username');
+    var usernameInput = document.querySelector('#register-form #username');
     if (usernameInput) {
         var timeout;
         usernameInput.addEventListener('input', function() {

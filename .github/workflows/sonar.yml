@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - lab-vulnerable
+      - lab-fixed
 
 permissions:
   contents: read
@@ -24,4 +25,4 @@ jobs:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
         with:
           args: >
-            -Dsonar.branch.name=lab-vulnerable
+            -Dsonar.branch.name=${{ github.ref_name }}

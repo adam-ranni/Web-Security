@@ -218,105 +218,21 @@ def index():
     return render_template('index.html', books=books)
 
 
-@app.route('/books')
+@app.get('/books')
 def books():
-    search = request.args.get('search', '')
-    conn = get_shop_db()
-    c = conn.cursor()
-
-    if search:
-        # A7 вЂ” SQL injection in search. Toggleable: secure mode uses a
-        # parameterized query so injection is no longer possible.
-        if is_secure('A7_sqli_search'):
-            c.execute("SELECT * FROM books WHERE title LIKE ? OR author LIKE ?",
-                      (f'%{search}%', f'%{search}%'))
-            book_list = c.fetchall()
-        elif not waf_check(search):
-            try:
-                query = f"SELECT * FROM books WHERE title LIKE '%{search}%' OR author LIKE '%{search}%'"
-                c.execute(query)
-                book_list = c.fetchall()
-            except sqlite3.Error:
-                book_list = []
-                flash('Search error occurred.', 'danger')
-        else:
-            flash('WAF Detection: Suspicious input detected!', 'danger')
-            book_list = []
-    else:
-        c.execute('SELECT * FROM books')
-        book_list = c.fetchall()
-
-    conn.close()
-    # B1 вЂ” Reflected XSS: search value passed to template (rendered with |safe in template)
-    return render_template('books.html', books=book_list, search=search)
+    query=text(request.args.get('search',''),200,required=False)
+    results=rows('SELECT * FROM books WHERE title LIKE ? OR author LIKE ? ORDER BY id',(f'%{query}%',f'%{query}%'))
+    return render_template('books.html',books=results,search=query)
 
 
-@app.route('/book_details')
+@app.get('/book_details')
 def book_details():
-    book_id = request.args.get('id', '')
-
-    if not book_id:
-        flash('Book ID is required.', 'danger')
-        return redirect(url_for('books'))
-
-    conn = get_shop_db()
-    c = conn.cursor()
-
-    try:
-        # WAF check вЂ” bypassable
-        if waf_check(book_id):
-            return "WAF blocked suspicious input", 403
-
-        # Strip MySQL-style comments for SQLite compatibility
-        cleaned_id = book_id.replace("/*!50000", "").replace("*/", "")
-
-        # A1/A2 вЂ” Error-based & UNION-based SQL injection
-        query = f"SELECT id, title, author, price, image, description, category, stock FROM books WHERE id = {cleaned_id}"
-
-        try:
-            c.execute(query)
-            book = c.fetchone()
-        except sqlite3.OperationalError as sql_err:
-            # J3 вЂ” Verbose error messages
-            conn.close()
-            return f"SQL Error: {str(sql_err)}", 500
-
-        if not book:
-            conn.close()
-            return "Book not found", 404
-
-        # Get reviews for this book (with username from users.db)
-        c.execute('SELECT * FROM reviews WHERE book_id = ? ORDER BY created_at DESC', (book['id'],))
-        reviews_raw = c.fetchall()
-        conn.close()
-
-        # Fetch usernames from user DB
-        uconn = get_user_db()
-        uc = uconn.cursor()
-        reviews = []
-        for r in reviews_raw:
-            uc.execute('SELECT username FROM users WHERE id = ?', (r['user_id'],))
-            u = uc.fetchone()
-            reviews.append({
-                'id': r['id'],
-                'user_id': r['user_id'],
-                'book_id': r['book_id'],
-                'rating': r['rating'],
-                'comment': r['comment'],
-                'created_at': r['created_at'],
-                'username': u['username'] if u else 'Unknown'
-            })
-        uconn.close()
-
-        return render_template('book_details.html', book=book, reviews=reviews)
-
-    except Exception as e:
-        return f"Error: {str(e)}", 500
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
+    book_id=positive_int(request.args.get('id'),2**31-1)
+    book=one('SELECT * FROM books WHERE id=?',(book_id,))
+    if not book:
+        abort(404)
+    reviews=rows('SELECT reviews.*,users.username FROM reviews LEFT JOIN users ON users.id=reviews.user_id WHERE book_id=? ORDER BY reviews.created_at DESC',(book_id,))
+    return render_template('book_details.html',book=book,reviews=reviews)
 
 
 @app.get('/profile')
@@ -586,125 +502,53 @@ def order_history():
     return render_template('order_history.html', orders=orders)
 
 
-@app.route('/order/<int:order_id>')
+@app.get('/order/<int:order_id>')
 @login_required
 def order_detail(order_id):
-    conn = get_shop_db()
-    c = conn.cursor()
-
-    # D2 вЂ” IDOR: No check if order belongs to current user
-    c.execute('SELECT * FROM orders WHERE id = ?', (order_id,))
-    order = c.fetchone()
-
-    if not order:
-        conn.close()
-        flash('Order not found.', 'danger')
-        return redirect(url_for('order_history'))
-
-    c.execute('''SELECT order_items.*, books.title, books.author, books.image
-                 FROM order_items
-                 JOIN books ON order_items.book_id = books.id
-                 WHERE order_items.order_id = ?''', (order_id,))
-    items = c.fetchall()
-    conn.close()
-
-    return render_template('order_detail.html', order=order, items=items)
+    order=owned_order(order_id)
+    items=rows('SELECT order_items.*,books.title,books.author,books.image FROM order_items JOIN books ON books.id=order_items.book_id WHERE order_id=?',(order_id,))
+    return render_template('order_detail.html',order=order,items=items)
 
 
-@app.route('/download_receipt/<int:order_id>')
+@app.get('/download_receipt/<int:order_id>')
 @login_required
 def download_receipt(order_id):
-    # D3 вЂ” IDOR: No ownership check
-    conn = get_shop_db()
-    c = conn.cursor()
-    c.execute('SELECT * FROM orders WHERE id = ?', (order_id,))
-    order = c.fetchone()
-
-    if not order:
-        conn.close()
-        return "Order not found", 404
-
-    c.execute('''SELECT order_items.*, books.title
-                 FROM order_items
-                 JOIN books ON order_items.book_id = books.id
-                 WHERE order_items.order_id = ?''', (order_id,))
-    items = c.fetchall()
-    conn.close()
-
-    # Generate text receipt
-    receipt = f"=== RECEIPT вЂ” Order #{order_id} ===\n"
-    receipt += f"Date: {order['created_at']}\n"
-    receipt += f"Status: {order['status']}\n"
-    receipt += f"Shipping: {order['shipping_address']}\n\n"
-    receipt += "Items:\n"
-    for item in items:
-        receipt += f"  - {item['title']} x{item['quantity']} @ ${item['price']:.2f}\n"
-    receipt += f"\nTotal: ${order['total']:.2f}\n"
-
-    response = make_response(receipt)
-    response.headers['Content-Type'] = 'text/plain'
-    response.headers['Content-Disposition'] = f'attachment; filename=receipt_{order_id}.txt'
+    order=owned_order(order_id)
+    items=rows('SELECT order_items.*,books.title FROM order_items JOIN books ON books.id=order_items.book_id WHERE order_id=?',(order_id,))
+    lines=[f"Receipt - Order #{order_id}",f"Date: {order['created_at']}",f"Status: {order['status']}",f"Shipping: {order['shipping_address']}",'Items:']
+    lines.extend(f"  {item['title']} x{item['quantity']} @ ${item['price']:.2f}" for item in items)
+    lines.append(f"Total: ${order['total']:.2f}")
+    response=make_response('\n'.join(lines))
+    response.mimetype='text/plain'
+    response.headers['Content-Disposition']=f'attachment; filename=receipt_{order_id}.txt'
     return response
 
 
-@app.route('/review/<int:book_id>', methods=['POST'])
+@app.post('/review/<int:book_id>')
 @login_required
 def add_review(book_id):
-    rating = request.form.get('rating', 5, type=int)
-    comment = request.form.get('comment', '')
-
-    # B2 вЂ” Stored XSS: comment stored without sanitization
-    conn = get_shop_db()
-    c = conn.cursor()
-    c.execute('''INSERT INTO reviews (user_id, book_id, rating, comment)
-                VALUES (?, ?, ?, ?)''',
-             (session['user_id'], book_id, rating, comment))
-    conn.commit()
-    conn.close()
-
-    flash('Review posted!', 'success')
-    return redirect(url_for('book_details', id=book_id))
+    if not one('SELECT id FROM books WHERE id=?',(book_id,)):
+        abort(404)
+    rating=positive_int(request.form.get('rating'),5)
+    comment=text(request.form.get('comment',''),4000)
+    write('INSERT INTO reviews (user_id,book_id,rating,comment) VALUES (?,?,?,?)',(g.user['id'],book_id,rating,comment))
+    return redirect(url_for('book_details',id=book_id))
 
 
-@app.route('/edit_review/<int:review_id>', methods=['POST'])
+@app.post('/edit_review/<int:review_id>')
 @login_required
 def edit_review(review_id):
-    # D4 вЂ” IDOR: No ownership check on review
-    comment = request.form.get('comment', '')
-    rating = request.form.get('rating', 5, type=int)
-
-    conn = get_shop_db()
-    c = conn.cursor()
-    c.execute('UPDATE reviews SET comment = ?, rating = ? WHERE id = ?',
-              (comment, rating, review_id))
-    conn.commit()
-
-    c.execute('SELECT book_id FROM reviews WHERE id = ?', (review_id,))
-    review = c.fetchone()
-    conn.close()
-
-    flash('Review updated.', 'success')
-    if review:
-        return redirect(url_for('book_details', id=review['book_id']))
-    return redirect(url_for('books'))
+    review=owned_review(review_id)
+    write('UPDATE reviews SET comment=?,rating=? WHERE id=?',(text(request.form.get('comment',''),4000),positive_int(request.form.get('rating'),5),review_id))
+    return redirect(url_for('book_details',id=review['book_id']))
 
 
-@app.route('/delete_review/<int:review_id>', methods=['POST'])
+@app.post('/delete_review/<int:review_id>')
 @login_required
 def delete_review(review_id):
-    # D4 вЂ” IDOR: No ownership check
-    conn = get_shop_db()
-    c = conn.cursor()
-    c.execute('SELECT book_id FROM reviews WHERE id = ?', (review_id,))
-    review = c.fetchone()
-    c.execute('DELETE FROM reviews WHERE id = ?', (review_id,))
-    conn.commit()
-    conn.close()
-
-    flash('Review deleted.', 'success')
-    if review:
-        return redirect(url_for('book_details', id=review['book_id']))
-    return redirect(url_for('books'))
+    review=owned_review(review_id)
+    write('DELETE FROM reviews WHERE id=?',(review_id,))
+    return redirect(url_for('book_details',id=review['book_id']))
 
 
 @app.route('/transfer', methods=['GET', 'POST'])
@@ -799,53 +643,20 @@ def new_ticket():
     return render_template('new_ticket.html')
 
 
-@app.route('/api/check_username')
+@app.get('/api/check_username')
 def api_check_username():
-    """A3 вЂ” Blind Boolean SQL injection."""
-    username = request.args.get('username', '')
-
-    conn = get_user_db()
-    c = conn.cursor()
-
-    try:
-        # Vulnerable to blind boolean SQLi
-        query = f"SELECT * FROM users WHERE username = '{username}'"
-        c.execute(query)
-        user = c.fetchone()
-        conn.close()
-
-        if user:
-            return jsonify({'exists': True, 'message': 'Username is taken'})
-        else:
-            return jsonify({'exists': False, 'message': 'Username is available'})
-    except sqlite3.Error as e:
-        conn.close()
-        return jsonify({'error': str(e)}), 500
+    limit_action('username-availability',120)
+    username=text(request.args.get('username',''),64)
+    exists=one('SELECT id FROM users WHERE username=?',(username,)) is not None
+    return jsonify(exists=exists,message='Username is taken' if exists else 'Username is available')
 
 
-@app.route('/api/check_coupon')
+@app.get('/api/check_coupon')
 def api_check_coupon():
-    """A4 вЂ” Time-based Blind SQL injection."""
-    code = request.args.get('code', '')
-
-    conn = get_shop_db()
-    c = conn.cursor()
-
-    try:
-        # Vulnerable to time-based blind SQLi (SQLite doesn't have SLEEP but
-        # we simulate with a heavy query or use CASE WHEN with randomblob)
-        query = f"SELECT * FROM coupons WHERE code = '{code}'"
-        c.execute(query)
-        coupon = c.fetchone()
-        conn.close()
-
-        if coupon:
-            return jsonify({'valid': True, 'discount': coupon['discount_percent']})
-        else:
-            return jsonify({'valid': False})
-    except sqlite3.Error as e:
-        conn.close()
-        return jsonify({'error': str(e)}), 500
+    limit_action('coupon-availability',120)
+    code=text(request.args.get('code',''),64)
+    coupon=one('SELECT discount_percent FROM coupons WHERE code=? AND is_active=1 AND current_uses<max_uses',(code,))
+    return jsonify(valid=True,discount=coupon['discount_percent']) if coupon else jsonify(valid=False)
 
 
 @app.get('/api/user/<int:user_id>/card')
@@ -915,21 +726,34 @@ def api_import_books():
         return jsonify({'error': str(e)}), 500
 
 
-@app.route('/api/load_cart', methods=['POST'])
+@app.post('/api/load_cart')
+@login_required
 def api_load_cart():
-    """L4 вЂ” Insecure deserialization: pickle-based cart restore."""
-    cart_data = request.form.get('cart_data', '')
-
-    if not cart_data:
-        return jsonify({'error': 'No cart data provided'}), 400
-
     try:
-        # Insecure deserialization вЂ” pickle.loads on user input
-        decoded = base64.b64decode(cart_data)
-        cart = pickle.loads(decoded)
-        return jsonify({'success': True, 'cart': str(cart)})
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        data=request.get_json(silent=True)
+        if data is None:
+            data=json.loads(request.form.get('cart_data',''))
+        if not isinstance(data,list) or len(data)>50:
+            abort(400,description='Send a JSON list of at most 50 cart items')
+        items={}
+        for item in data:
+            if not isinstance(item,dict) or set(item)!={'book_id','quantity'}:
+                abort(400)
+            book_id=positive_int(item['book_id'],2**31-1)
+            quantity=positive_int(item['quantity'])
+            if book_id in items:
+                abort(400)
+            items[book_id]=quantity
+        with transaction(app.config['DATABASE']) as db:
+            for book_id,quantity in items.items():
+                book=db.execute('SELECT stock FROM books WHERE id=?',(book_id,)).fetchone()
+                if not book or book['stock']<quantity:
+                    abort(409)
+            db.execute('DELETE FROM cart WHERE user_id=?',(g.user['id'],))
+            db.executemany('INSERT INTO cart (user_id,book_id,quantity) VALUES (?,?,?)',[(g.user['id'],book_id,quantity) for book_id,quantity in items.items()])
+        return jsonify(success=True,items=len(items))
+    except (ValueError,TypeError):
+        abort(400,description='Invalid JSON cart')
 
 
 @app.route('/admin')
@@ -1135,20 +959,18 @@ def admin_reset_data():
     abort(405)
 
 
-@app.route('/redirect')
+@app.get('/redirect')
 def open_redirect():
-    """L1 вЂ” Open redirect: no URL validation."""
-    url = request.args.get('url', '/')
-    return redirect(url)
+    return redirect(safe_redirect(request.args.get('url','/')))
 
 
-@app.route('/set_language')
+@app.post('/set_language')
 def set_language():
-    """L2 вЂ” HTTP header injection."""
-    lang = request.args.get('lang', 'en')
-    response = make_response(redirect(url_for('index')))
-    # Header injection: lang value injected into Set-Cookie header
-    response.headers['Set-Cookie'] = f'language={lang}; Path=/'
+    lang=request.form.get('lang','en')
+    if lang not in {'en','ru','my'}:
+        abort(400)
+    response=make_response(redirect(url_for('index')))
+    response.set_cookie('language',lang,httponly=True,secure=app.config['SESSION_COOKIE_SECURE'],samesite='Lax')
     return response
 
 
@@ -1183,24 +1005,11 @@ def backup_file():
     abort(404)
 
 
-@app.route('/search')
+@app.get('/search')
 def search_page():
-    """B1 вЂ” Reflected XSS via search page."""
-    q = request.args.get('q', '')
-    conn = get_shop_db()
-    c = conn.cursor()
-
-    if q:
-        c.execute('SELECT * FROM books WHERE title LIKE ? OR author LIKE ?',
-                 (f'%{q}%', f'%{q}%'))
-    else:
-        c.execute('SELECT * FROM books')
-
-    results = c.fetchall()
-    conn.close()
-
-    # B1 вЂ” search query passed to template, rendered with |safe
-    return render_template('search.html', query=q, results=results)
+    query=text(request.args.get('q',''),200,required=False)
+    results=rows('SELECT * FROM books WHERE title LIKE ? OR author LIKE ? ORDER BY id',(f'%{query}%',f'%{query}%'))
+    return render_template('search.html',query=query,results=results)
 
 
 @app.post('/lab/reset')

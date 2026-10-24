@@ -1,125 +1,78 @@
-/* ============================================================
-   Bookshop-M — Client-side JavaScript
-   Contains intentional DOM-based XSS vulnerability (B3)
-   ============================================================ */
-
-// B3 — DOM-based XSS: Hash fragment injected into innerHTML
-document.addEventListener('DOMContentLoaded', function() {
-    // Greeting banner from URL hash (VULNERABLE)
-    if (window.location.hash) {
-        var greeting = decodeURIComponent(window.location.hash.substring(1));
-        var el = document.getElementById('greeting-banner');
-        if (el) {
-            el.innerHTML = greeting;  // DOM XSS — innerHTML with user input
-        }
+/* Client enhancements; all validation and authorization also run on the server. */
+document.addEventListener('DOMContentLoaded', function () {
+    const banner = document.getElementById('greeting-banner');
+    if (banner && window.location.hash) {
+        try { banner.textContent = decodeURIComponent(window.location.hash.slice(1)); }
+        catch { banner.textContent = window.location.hash.slice(1); }
     }
-
-    // Auto-dismiss flash messages after 5 seconds
-    var alerts = document.querySelectorAll('.alert-dismissible');
-    alerts.forEach(function(alert) {
-        setTimeout(function() {
-            var bsAlert = new bootstrap.Alert(alert);
-            bsAlert.close();
+    document.querySelectorAll('.alert-dismissible').forEach(function (element) {
+        if (window.bootstrap) setTimeout(function () {
+            bootstrap.Alert.getOrCreateInstance(element).close();
         }, 5000);
     });
-
-    // Confirm dangerous actions
-    var dangerForms = document.querySelectorAll('.danger-confirm');
-    dangerForms.forEach(function(form) {
-        form.addEventListener('submit', function(e) {
-            if (!confirm('Are you sure? This action cannot be undone.')) {
-                e.preventDefault();
-            }
+    document.querySelectorAll('.danger-confirm').forEach(function (form) {
+        form.addEventListener('submit', function (event) {
+            if (!confirm('Are you sure? This action cannot be undone.')) event.preventDefault();
         });
     });
-
-    // Cart quantity validation (client-side only — K1 bypass)
-    var qtyInputs = document.querySelectorAll('.qty-input');
-    qtyInputs.forEach(function(input) {
-        input.addEventListener('change', function() {
-            // Client-side check that can be bypassed
-            if (this.value < 1) {
-                this.classList.add('is-invalid');
-            } else {
-                this.classList.remove('is-invalid');
-            }
+    document.querySelectorAll('.qty-input').forEach(function (input) {
+        input.addEventListener('change', function () {
+            const quantity = Number(this.value);
+            this.setCustomValidity(Number.isInteger(quantity) && quantity >= 1 && quantity <= 100 ? '' : 'Choose a quantity from 1 to 100');
         });
     });
-
-    // Balance check for checkout (client-side only — K5 bypass)
-    var checkoutForm = document.getElementById('checkout-form');
-    if (checkoutForm) {
-        checkoutForm.addEventListener('submit', function(e) {
-            var balance = parseFloat(document.getElementById('user-balance').dataset.balance || 0);
-            var total = parseFloat(document.getElementById('order-total').dataset.total || 0);
-            if (total > balance) {
-                // Client-side only check — can be bypassed by modifying hidden total field
-                e.preventDefault();
-                alert('Insufficient balance! You need $' + (total - balance).toFixed(2) + ' more.');
-            }
-        });
-    }
-
-    // Username availability check (triggers blind SQLi endpoint)
-    var usernameInput = document.querySelector('#register-form #username');
-    if (usernameInput) {
-        var timeout;
-        usernameInput.addEventListener('input', function() {
+    const checkout = document.getElementById('checkout-form');
+    if (checkout) checkout.addEventListener('submit', function (event) {
+        const balance = Number.parseFloat(document.getElementById('user-balance').dataset.balance);
+        const total = Number.parseFloat(document.getElementById('order-total').dataset.total);
+        if (total > balance) { event.preventDefault(); alert('Insufficient balance.'); }
+    });
+    const username = document.querySelector('#register-form #username');
+    if (username) {
+        let timeout;
+        username.addEventListener('input', function () {
             clearTimeout(timeout);
-            var username = this.value;
-            if (username.length > 2) {
-                timeout = setTimeout(function() {
-                    fetch('/api/check_username?username=' + encodeURIComponent(username))
-                        .then(function(r) { return r.json(); })
-                        .then(function(data) {
-                            var feedback = document.getElementById('username-feedback');
-                            if (feedback) {
-                                if (data.exists) {
-                                    feedback.textContent = 'Username is taken';
-                                    feedback.style.color = '#ff0055';
-                                } else {
-                                    feedback.textContent = 'Username is available';
-                                    feedback.style.color = '#00ff41';
-                                }
-                            }
-                        });
-                }, 500);
-            }
+            const value = this.value;
+            const feedback = document.getElementById('username-feedback');
+            feedback.textContent = '';
+            if (value.length < 3) return;
+            timeout = setTimeout(async function () {
+                try {
+                    const response = await fetch('/api/check_username?username=' + encodeURIComponent(value));
+                    if (!response.ok) throw new Error('Unavailable');
+                    const data = await response.json();
+                    if (username.value === value) feedback.textContent = data.exists ? 'Username is taken' : 'Username is available';
+                } catch { if (username.value === value) feedback.textContent = 'Availability check unavailable'; }
+            }, 500);
         });
     }
-
-    // Coupon code check (triggers time-based blind SQLi endpoint)
-    var couponBtn = document.getElementById('check-coupon-btn');
-    if (couponBtn) {
-        couponBtn.addEventListener('click', function() {
-            var code = document.getElementById('coupon-code-input').value;
-            if (code) {
-                fetch('/api/check_coupon?code=' + encodeURIComponent(code))
-                    .then(function(r) { return r.json(); })
-                    .then(function(data) {
-                        var feedback = document.getElementById('coupon-feedback');
-                        if (feedback) {
-                            if (data.valid) {
-                                feedback.textContent = 'Valid! ' + data.discount + '% off';
-                                feedback.style.color = '#00ff41';
-                            } else {
-                                feedback.textContent = 'Invalid coupon';
-                                feedback.style.color = '#ff0055';
-                            }
-                        }
-                    });
-            }
-        });
-    }
-
-    // Add matrix rain effect to hero sections
-    var heroSection = document.querySelector('.hero-section');
-    if (heroSection) {
-        createMatrixRain(heroSection);
-    }
+    const coupon = document.getElementById('check-coupon-btn');
+    if (coupon) coupon.addEventListener('click', async function () {
+        const code = document.getElementById('coupon-code-input').value;
+        const feedback = document.getElementById('coupon-feedback');
+        feedback.textContent = '';
+        if (!code) return;
+        try {
+            const response = await fetch('/api/check_coupon?code=' + encodeURIComponent(code));
+            if (!response.ok) throw new Error('Unavailable');
+            const data = await response.json();
+            feedback.textContent = data.valid ? 'Valid! ' + data.discount + '% off' : 'Invalid coupon';
+        } catch { feedback.textContent = 'Coupon check unavailable'; }
+    });
+    const toggle = document.getElementById('password-toggle');
+    if (toggle) toggle.addEventListener('click', function () {
+        const password = document.getElementById('password');
+        const icon = document.getElementById('toggleIcon');
+        const hidden = password.type === 'password';
+        password.type = hidden ? 'text' : 'password';
+        icon.classList.replace(hidden ? 'fa-eye' : 'fa-eye-slash', hidden ? 'fa-eye-slash' : 'fa-eye');
+    });
+    const back = document.getElementById('go-back');
+    if (back) back.addEventListener('click', function () { window.history.back(); });
+    const hero = document.querySelector('.hero-section');
+    if (hero) createMatrixRain(hero);
 });
 
-// Matrix rain effect
 function createMatrixRain(container) {
     var canvas = document.createElement('canvas');
     canvas.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;opacity:0.1;z-index:0;';

@@ -157,7 +157,10 @@ def positive_int(value, maximum=100):
 def safe_redirect(value, default='/'):
     if not isinstance(value,str) or any(ord(c)<32 for c in value) or '\\' in value:
         return default
-    parsed=urlsplit(value)
+    try:
+        parsed=urlsplit(value)
+    except ValueError:
+        return default
     if parsed.scheme or parsed.netloc or not value.startswith('/') or value.startswith('//'):
         return default
     return value

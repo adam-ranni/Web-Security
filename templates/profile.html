@@ -12,11 +12,11 @@
             <!-- Profile Card -->
             <div class="cyber-card profile-main-card mb-4 animate-in">
                 <div class="text-center">
-                    <!-- Profile Picture (B5: XSS via filename with |safe) -->
+                    <!-- Profile Picture (B5: XSS via filename with ) -->
                     <div class="profile-pic-wrapper mb-3">
                         {% if user['profile_pic'] %}
                             <img src="/static/uploads/{{ user['profile_pic'] }}" alt="Profile" class="profile-pic">
-                            <div class="profile-pic-name">{{ user['profile_pic']|safe }}</div>
+                            <div class="profile-pic-name">{{ user['profile_pic'] }}</div>
                         {% else %}
                             <div class="profile-pic-placeholder">
                                 <i class="fas fa-user-secret"></i>
@@ -91,14 +91,14 @@
                 </div>
             </div>
 
-            <!-- Bio Section (B4: Stored XSS via |safe) -->
+            <!-- Bio Section (B4: Stored XSS via ) -->
             <div class="cyber-card mb-4 animate-in animate-delay-2">
                 <h5 class="card-section-title">
                     <i class="fas fa-terminal me-2 text-green"></i>Bio
                 </h5>
                 <div class="bio-content mt-2">
                     {% if user['bio'] %}
-                        {{ user['bio']|safe }}
+                        {{ user['bio'] }}
                     {% else %}
                         <p class="text-muted" style="font-family: var(--font-mono); font-size: 0.85rem;">
                             <i class="fas fa-ghost me-1"></i> No bio set. Edit your profile to add one.

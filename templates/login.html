@@ -70,7 +70,7 @@
                             <input type="password" name="password" id="password"
                                    class="form-control form-control-cyber"
                                    placeholder="Enter password" required autocomplete="current-password">
-                            <button type="button" class="password-toggle" onclick="togglePassword()">
+                            <button type="button" class="password-toggle" id="password-toggle">
                                 <i class="fas fa-eye" id="toggleIcon"></i>
                             </button>
                         </div>
@@ -222,17 +222,5 @@
     }
 </style>
 
-<script>
-function togglePassword() {
-    var pw = document.getElementById('password');
-    var icon = document.getElementById('toggleIcon');
-    if (pw.type === 'password') {
-        pw.type = 'text';
-        icon.classList.replace('fa-eye', 'fa-eye-slash');
-    } else {
-        pw.type = 'password';
-        icon.classList.replace('fa-eye-slash', 'fa-eye');
-    }
-}
-</script>
+
 {% endblock %}

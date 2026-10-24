@@ -103,5 +103,62 @@ class ShopTests(unittest.TestCase):
         self.assertEqual(before,[hashlib.sha256(p.read_bytes()).digest() for p in files])
         with self.assertRaises(ValueError): migrate(*files,destination)
 
+    def test_sql_queries_and_escaped_output(self):
+        self.assertEqual(self.a.get('/book_details?id=1%20OR%201=1').status_code,400)
+        response=self.post(self.a,'/login',dict(username="admin' OR '1'='1",password='unrelated-password'))
+        self.assertEqual(response.status_code,200)
+        self.assertEqual(self.a.get('/profile').status_code,302)
+        payload='<img src=x onerror=alert(1)>'
+        for path in ['/search','/books']:
+            response=self.a.get(path,query_string={'q':payload} if path.startswith('/search') else {'search':payload})
+            self.assertNotIn(payload.encode(),response.data)
+            self.assertIn(b'&lt;img',response.data)
+        self.assertFalse(self.a.get('/api/check_username',query_string={'username':"admin' OR '1'='1"}).json['exists'])
+        self.assertFalse(self.a.get('/api/check_coupon',query_string={'code':"x' OR '1'='1"}).json['valid'])
+        self.register(self.a,'qa_alice')
+        self.post(self.a,'/review/1',dict(rating=4,comment=payload))
+        response=self.a.get('/book_details?id=1')
+        self.assertNotIn(payload.encode(),response.data)
+        self.assertIn(b'&lt;img',response.data)
+
+    def test_order_review_ownership_and_json_cart(self):
+        aid=self.register(self.a,'qa_alice');self.register(self.b,'qa_bob')
+        self.sql('INSERT INTO orders (user_id,total_cents) VALUES (?,?)',(aid,2999))
+        oid=self.sql('SELECT id FROM orders')[0]['id']
+        self.assertEqual(self.b.get('/order/'+str(oid)).status_code,404)
+        self.assertEqual(self.b.get('/download_receipt/'+str(oid)).status_code,404)
+        self.assertEqual(self.a.get('/download_receipt/'+str(oid)).status_code,200)
+        self.post(self.a,'/review/1',dict(rating=4,comment='Normal review'))
+        rid=self.sql('SELECT id FROM reviews')[0]['id']
+        for prefix in ['/edit_review/','/delete_review/']:
+            self.assertEqual(self.post(self.b,prefix+str(rid),dict(rating=1,comment='Other')).status_code,404)
+        self.assertEqual(self.post(self.a,'/api/load_cart',json=[dict(book_id=1,quantity=2)]).status_code,200)
+        self.assertEqual(self.sql('SELECT quantity FROM cart WHERE user_id=?',(aid,))[0]['quantity'],2)
+        self.assertEqual(self.post(self.a,'/api/load_cart',dict(cart_data='gASVpickleFixture')).status_code,400)
+        self.assertEqual(self.post(self.a,'/api/load_cart',json=[dict(book_id=1,quantity=-2)]).status_code,400)
+        self.assertEqual(self.sql('SELECT quantity FROM cart WHERE user_id=?',(aid,))[0]['quantity'],2)
+
+    def test_redirect_and_jwt_validation(self):
+        for value in ['https://example.invalid','//example.invalid','/\\example.invalid','http://[']:
+            response=self.a.get('/redirect',query_string={'url':value})
+            self.assertEqual(response.status_code,302)
+            self.assertEqual(response.headers['Location'],'/')
+        self.register(self.a,'qa_alice')
+        response=self.post(self.a,'/api/jwt/login',json=dict(username='qa_alice',password=self.password))
+        self.assertEqual(response.status_code,200)
+        token=response.json['token']
+        headers={'Authorization':'Bearer '+token}
+        self.assertEqual(self.a.get('/api/jwt/me',headers=headers).status_code,200)
+        self.assertEqual(self.a.get('/api/jwt/admin',headers=headers).status_code,403)
+        import jwt
+        claims=jwt.decode(token,shop.app.config['JWT_SECRET'],algorithms=['HS256'],audience='dv-bookshop-api')
+        unsigned=jwt.encode(claims,key='',algorithm='none')
+        self.assertEqual(self.a.get('/api/jwt/me',headers={'Authorization':'Bearer '+unsigned}).status_code,401)
+        claims['exp']=int(time.time())-1
+        expired=jwt.encode(claims,shop.app.config['JWT_SECRET'],algorithm='HS256')
+        self.assertEqual(self.a.get('/api/jwt/me',headers={'Authorization':'Bearer '+expired}).status_code,401)
+        self.sql('UPDATE users SET auth_version=auth_version+1 WHERE username=?',('qa_alice',))
+        self.assertEqual(self.a.get('/api/jwt/me',headers=headers).status_code,401)
+
 
 if __name__=='__main__': unittest.main()

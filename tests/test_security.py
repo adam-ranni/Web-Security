@@ -93,12 +93,16 @@ class ShopTests(unittest.TestCase):
         files=[source/'users.db',source/'bookshop.db']
         before=[hashlib.sha256(p.read_bytes()).digest() for p in files]
         destination=self.directory/'migrated.sqlite3'
-        migrate(*files,destination)
+        import shutil
+        copies=[self.directory/p.name for p in files]
+        for source,copy in zip(files,copies): shutil.copy2(source,copy)
+        migrate(*copies,destination)
         db=connect(destination)
         try:
             self.assertGreater(db.execute('SELECT COUNT(*) FROM users').fetchone()[0],0)
             self.assertTrue(all(r[0].startswith(('scrypt:','pbkdf2:')) for r in db.execute('SELECT password FROM users')))
             self.assertFalse(db.execute('PRAGMA foreign_key_check').fetchall())
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM users WHERE password_reset_required=0').fetchone()[0],0)
         finally: db.close()
         self.assertEqual(before,[hashlib.sha256(p.read_bytes()).digest() for p in files])
         with self.assertRaises(ValueError): migrate(*files,destination)
@@ -288,6 +292,98 @@ class ShopTests(unittest.TestCase):
         self.assertEqual(self.post(self.a,endpoint,json=dict(recipient='bob_secure',amount='75')).status_code,409)
         self.assertEqual(self.sql('SELECT balance_cents FROM race_accounts WHERE username=?',('alice_hacker',))[0]['balance_cents'],2500)
         self.assertEqual(self.post(self.a,'/lab',dict(secure='')).status_code,405)
+
+    def test_normal_profile_support_and_admin_workflow(self):
+        aid=self.register(self.a,'qa_sarah')
+        self.assertEqual(self.post(self.a,'/edit_profile',dict(email='qa_sarah@example.invalid',bio='A normal profile')).status_code,302)
+        self.assertIn(b'A normal profile',self.a.get('/profile').data)
+        self.assertEqual(self.post(self.a,'/change_email',dict(new_email='new@example.invalid')).status_code,403)
+        self.assertEqual(self.post(self.a,'/change_email',dict(new_email='new@example.invalid',current_password=self.password)).status_code,302)
+        self.post(self.a,'/support/new',dict(subject='Normal support',message='Please help with a demo order'))
+        tid=self.sql('SELECT id FROM support_tickets')[0]['id']
+        self.login(self.b)
+        self.assertEqual(self.post(self.b,'/admin/ticket/'+str(tid)+'/reply',dict(reply='Resolved in class')).status_code,302)
+        self.assertIn(b'Resolved in class',self.a.get('/support').data)
+        self.assertEqual(self.sql('SELECT status FROM support_tickets')[0]['status'],'closed')
+        admin=self.b.get('/admin/users').data
+        self.assertNotIn(b'scrypt:',admin);self.assertNotIn(self.password.encode(),admin)
+        self.assertEqual(self.a.get('/debug_db').status_code,404)
+        self.assertEqual(self.a.get('/app.py.bak').status_code,404)
+        self.assertEqual(self.post(self.b,'/admin/reset_data').status_code,405)
+        self.assertEqual(self.post(self.b,'/lab/reset').status_code,405)
+        self.assertEqual(self.post(self.a,'/change_password',dict(new_password=self.password)).status_code,403)
+        new_password=secrets.token_urlsafe(16)
+        self.assertEqual(self.post(self.a,'/change_password',dict(new_password=new_password,current_password=self.password)).status_code,302)
+        self.assertEqual(self.a.get('/profile').status_code,302)
+        self.assertEqual(self.post(self.a,'/login',dict(username='qa_sarah',password=new_password)).status_code,302)
+
+    def test_headers_cookie_policy_and_login_limits(self):
+        response=self.a.get('/api/csrf')
+        cookie=response.headers['Set-Cookie']
+        self.assertIn('HttpOnly',cookie);self.assertIn('SameSite=Lax',cookie)
+        self.assertNotIn('; Secure',cookie)
+        self.assertEqual(response.headers['X-Content-Type-Options'],'nosniff')
+        self.assertEqual(response.headers['X-Frame-Options'],'DENY')
+        self.assertIn("form-action 'self'",response.headers['Content-Security-Policy'])
+        with patch.dict(shop.app.config,{'SESSION_COOKIE_SECURE':True}):
+            response=self.b.get('/api/csrf',base_url='https://localhost')
+            self.assertIn('; Secure',response.headers['Set-Cookie'])
+            self.assertIn('Strict-Transport-Security',response.headers)
+        for _ in range(5):
+            self.assertEqual(self.post(self.a,'/login',dict(username='admin',password=secrets.token_urlsafe(16))).status_code,200)
+        self.assertEqual(self.post(self.a,'/login',dict(username='admin',password=self.password)).status_code,429)
+
+    def test_rendered_form_contracts(self):
+        from html.parser import HTMLParser
+        class Forms(HTMLParser):
+            def __init__(self):
+                super().__init__();self.controls=[];self.labels=[];self.ids=[];self.forms=[];self.current=None;self.scripts=[]
+            def handle_starttag(self,tag,attrs):
+                d=dict(attrs)
+                if d.get('id'): self.ids.append(d['id'])
+                if tag=='label': self.labels.append(d.get('for'))
+                if tag=='form': self.current={'method':d.get('method','GET').upper(),'csrf':False};self.forms.append(self.current)
+                if tag=='input' and d.get('name')=='csrf_token' and self.current is not None: self.current['csrf']=True
+                if tag in ('input','textarea','select') and d.get('type','').lower() not in ('hidden','submit','button'): self.controls.append(d)
+                if tag=='script': self.scripts.append(d.get('src'))
+            def handle_endtag(self,tag):
+                if tag=='form': self.current=None
+        paths=['/','/books','/search?q=Normal','/login','/register','/forgot_password']
+        for path in paths:
+            response=self.a.get(path);self.assertEqual(response.status_code,200);self.check_markup(response,Forms)
+        self.register(self.a,'qa_alice')
+        self.post(self.a,'/add_to_cart/1',dict(quantity=1))
+        for _ in range(2): self.post(self.a,'/support/new',dict(subject='Demo',message='Classroom question'))
+        for path in ['/book_details?id=1','/profile','/edit_profile','/cart','/checkout','/transfer','/support','/support/new','/uploads']:
+            response=self.a.get(path);self.assertEqual(response.status_code,200);self.check_markup(response,Forms)
+        self.login(self.b)
+        for path in ['/admin','/admin/users','/admin/tickets','/admin/logs','/admin/ping','/admin/preview_url','/lab']:
+            response=self.b.get(path);self.assertEqual(response.status_code,200);self.check_markup(response,Forms)
+
+    def check_markup(self,response,parser_type):
+        parsed=parser_type();parsed.feed(response.get_data(as_text=True))
+        self.assertEqual(len(parsed.ids),len(set(parsed.ids)))
+        for control in parsed.controls:
+            self.assertIn(control.get('id'),parsed.labels)
+        for form in parsed.forms:
+            if form['method']=='POST': self.assertTrue(form['csrf'])
+        self.assertTrue(all(parsed.scripts))
+        self.assertEqual(parsed.scripts.count('/static/js/app.js'),1)
+
+    def test_local_password_activation_and_expired_reset(self):
+        self.register(self.a,'qa_alice')
+        self.sql('UPDATE users SET password_reset_required=1,auth_version=auth_version+1 WHERE username=?',('qa_alice',))
+        self.assertEqual(self.post(self.a,'/login',dict(username='qa_alice',password=self.password)).status_code,200)
+        self.assertEqual(self.a.get('/profile').status_code,302)
+        runner=shop.app.test_cli_runner()
+        result=runner.invoke(args=['set-password','qa_alice'],input=self.password+'\n'+self.password+'\n')
+        self.assertEqual(result.exit_code,0,result.output)
+        self.login(self.a,'qa_alice')
+        self.post(self.b,'/forgot_password',dict(username='qa_alice'))
+        aid=self.sql('SELECT id FROM users WHERE username=?',('qa_alice',))[0]['id']
+        link=(self.directory/'outbox'/str(aid)).read_text()
+        self.sql('UPDATE users SET reset_token_expiry=0 WHERE id=?',(aid,))
+        self.assertEqual(self.b.get(link).status_code,400)
 
 
 if __name__=='__main__': unittest.main()

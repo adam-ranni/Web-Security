@@ -13,13 +13,13 @@
                     <form action="{{ url_for('admin_preview_url') }}" method="POST" class="mb-4">
 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                         <div class="input-group">
-                            <input type="text" name="url" class="form-control bg-dark text-light border-secondary" 
-                                   placeholder="Enter URL to preview (e.g., http://example.com)" required>
+                            <label class="visually-hidden" for="field-admin_preview-1">Url</label><input id="field-admin_preview-1" type="text" name="url" class="form-control bg-dark text-light border-secondary"
+                                   placeholder="Enter URL to preview (e.g., https://example.com)" required>
                             <button type="submit" class="btn btn-outline-info">
                                 <i class="fas fa-eye me-1"></i>Preview
                             </button>
                         </div>
-                        <small class="text-muted">Fetch and preview content from any URL</small>
+                        <small class="text-muted">Only configured public HTTPS hosts are allowed; redirects are rejected.</small>
                     </form>
 
                     {% if content is not none %}

@@ -10,7 +10,7 @@
 
     <form action="{{ url_for('search_page') }}" method="GET" class="mb-4">
         <div class="input-group">
-            <input type="text" name="q" class="form-control bg-dark text-light border-success" 
+            <label class="visually-hidden" for="field-search-1">Q</label><input id="field-search-1" type="text" name="q" class="form-control bg-dark text-light border-success"
                    placeholder="Search books..." value="{{ query }}">
             <button class="btn btn-outline-success" type="submit">
                 <i class="fas fa-search"></i> Search
@@ -23,7 +23,7 @@
         {% for book in results %}
         <div class="col-md-4 col-sm-6">
             <div class="card h-100" style="background:rgba(0,255,65,0.05);border:1px solid rgba(0,255,65,0.2);transition:all 0.3s ease;">
-                <img src="{{ url_for('static', filename=book['image']) }}" class="card-img-top" alt="{{ book['title'] }}" 
+                <img src="{{ url_for('static', filename=book['image']) }}" class="card-img-top" alt="{{ book['title'] }}"
                      style="height:200px;object-fit:cover;border-bottom:1px solid rgba(0,255,65,0.2);">
                 <div class="card-body">
                     <span class="badge bg-secondary mb-2">{{ book['category'] }}</span>

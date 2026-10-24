@@ -13,13 +13,13 @@
                     <form action="{{ url_for('new_ticket') }}" method="POST">
 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                         <div class="mb-3">
-                            <label class="form-label text-muted">Subject</label>
-                            <input type="text" name="subject" class="form-control bg-dark text-light border-secondary" 
+                            <label for="field-new_ticket-1" class="form-label text-muted">Subject</label>
+                            <input id="field-new_ticket-1" type="text" name="subject" class="form-control bg-dark text-light border-secondary"
                                    placeholder="Brief description of your issue" required>
                         </div>
                         <div class="mb-4">
-                            <label class="form-label text-muted">Message</label>
-                            <textarea name="message" rows="6" class="form-control bg-dark text-light border-secondary" 
+                            <label for="field-new_ticket-2" class="form-label text-muted">Message</label>
+                            <textarea id="field-new_ticket-2" name="message" rows="6" class="form-control bg-dark text-light border-secondary"
                                       placeholder="Describe your issue in detail..." required></textarea>
                         </div>
                         <div class="d-flex gap-2">

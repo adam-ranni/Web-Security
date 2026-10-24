@@ -81,6 +81,7 @@ function createMatrixRain(container) {
     container.insertBefore(canvas, container.firstChild);
 
     var ctx = canvas.getContext('2d');
+    if (!ctx) return;
     canvas.width = container.offsetWidth;
     canvas.height = container.offsetHeight;
 

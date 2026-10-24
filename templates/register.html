@@ -68,12 +68,12 @@
                         </h6>
 
                         <div class="mb-3">
-                            <label for="credit_card_number" class="form-label-cyber">Card Number</label>
+                            <label for="credit_card_number" class="form-label-cyber">Demo card last four digits (optional)</label>
                             <input type="text" name="credit_card_number" id="credit_card_number"
                                    class="form-control form-control-cyber"
-                                   placeholder="1234-5678-9012-3456"
-                                   pattern="\d{4}-\d{4}-\d{4}-\d{4}"
-                                   title="Format: 1234-5678-9012-3456" required>
+                                   placeholder="0000" maxlength="4"
+                                   pattern="[0-9]{4}"
+                                   title="Four fictional digits">
                         </div>
 
                         <div class="row g-3 mb-3">
@@ -83,16 +83,9 @@
                                        class="form-control form-control-cyber"
                                        placeholder="MM/YY"
                                        pattern="\d{2}/\d{2}"
-                                       title="Format: MM/YY" required>
+                                       title="Format: MM/YY">
                             </div>
-                            <div class="col-md-6">
-                                <label for="credit_card_cvv" class="form-label-cyber">CVV</label>
-                                <input type="text" name="credit_card_cvv" id="credit_card_cvv"
-                                       class="form-control form-control-cyber"
-                                       placeholder="•••"
-                                       pattern="\d{3}"
-                                       title="3-digit CVV" required>
-                            </div>
+
                         </div>
                     </div>
 

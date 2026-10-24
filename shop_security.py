@@ -77,7 +77,7 @@ def configure(app):
         if not Path(app.config['DATABASE']).is_file():
             abort(503,description='Initialize or migrate the fixed database using the local CLI')
         if session.get('sid'):
-            user=one('SELECT users.* FROM users JOIN sessions ON users.id=sessions.user_id WHERE sessions.token_hash=? AND sessions.expires_at>? AND sessions.auth_version=users.auth_version AND users.is_active=1',(digest(session['sid']),int(time.time())))
+            user=one('SELECT users.* FROM users JOIN sessions ON users.id=sessions.user_id WHERE sessions.token_hash=? AND sessions.expires_at>? AND sessions.auth_version=users.auth_version AND users.is_active=1 AND users.password_reset_required=0',(digest(session['sid']),int(time.time())))
             if user:
                 g.user=user
                 session['user_id']=user['id']
@@ -95,7 +95,7 @@ def configure(app):
         response.headers['Referrer-Policy']='no-referrer'
         response.headers['Content-Security-Policy']=("default-src 'self'; script-src 'self' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com; font-src 'self' https://cdnjs.cloudflare.com; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
         response.headers['Permissions-Policy']='camera=(), microphone=(), geolocation=()'
-        if request.is_secure:
+        if request.is_secure or app.config['SESSION_COOKIE_SECURE']:
             response.headers['Strict-Transport-Security']='max-age=31536000'
         if request.endpoint!='static':
             response.headers['Cache-Control']='no-store'
@@ -171,7 +171,11 @@ def password_matches(user, password):
     if not stored.startswith(('scrypt:','pbkdf2:')):
         check_password_hash(DUMMY_PASSWORD,password)
         return False
-    return check_password_hash(stored,password) and bool(user and user['is_active'])
+    try:
+        matches=check_password_hash(stored,password)
+    except ValueError:
+        return False
+    return matches and bool(user and user['is_active'] and not user['password_reset_required'])
 
 
 def throttle_key(identity, purpose):
@@ -181,6 +185,7 @@ def throttle_key(identity, purpose):
 def authenticate(username,password):
     if not isinstance(username,str) or not isinstance(password,str) or len(username)>64 or len(password)>128:
         abort(400)
+    limit_action('login-ip',60)
     key=throttle_key(username,'login'); now=int(time.time())
     with transaction(current_app.config['DATABASE']) as db:
         info=db.execute('SELECT * FROM rate_limits WHERE key=?',(key,)).fetchone()
@@ -202,6 +207,7 @@ def start_session(user):
     session.clear()
     session.permanent=True
     session.update(sid=sid,user_id=user['id'],username=user['username'],role=user['role'])
+    write('DELETE FROM sessions WHERE expires_at<=?',(int(time.time()),))
     write('INSERT INTO sessions (token_hash,user_id,auth_version,expires_at) VALUES (?,?,?,?)',(digest(sid),user['id'],user['auth_version'],int(time.time())+SESSION_SECONDS))
 
 
@@ -222,7 +228,7 @@ def token_identity():
         abort(401)
     try:
         claims=jwt.decode(auth[7:],current_app.config['JWT_SECRET'],algorithms=['HS256'],issuer='dv-bookshop-fixed',audience='dv-bookshop-api',options={'require':['exp','iat','sub','ver','iss','aud']})
-        user=one('SELECT * FROM users WHERE id=? AND is_active=1',(positive_int(claims['sub'],2**31-1),))
+        user=one('SELECT * FROM users WHERE id=? AND is_active=1 AND password_reset_required=0',(positive_int(claims['sub'],2**31-1),))
         if not user or claims['ver']!=user['auth_version']:
             abort(401)
         return user

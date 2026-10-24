@@ -12,7 +12,7 @@
             <!-- Profile Card -->
             <div class="cyber-card profile-main-card mb-4 animate-in">
                 <div class="text-center">
-                    <!-- Profile Picture (B5: XSS via filename with ) -->
+
                     <div class="profile-pic-wrapper mb-3">
                         {% if user['profile_pic'] %}
                             <img src="{{ avatar_url(user) }}" alt="Profile" class="profile-pic">
@@ -62,7 +62,7 @@
 
         <!-- Right Column: Details -->
         <div class="col-lg-8">
-            <!-- J1: Credit Card Section — FULL card number exposed -->
+
             <div class="cyber-card mb-4 animate-in animate-delay-1">
                 <h5 class="card-section-title">
                     <i class="fas fa-credit-card me-2 text-cyan"></i>Payment Information
@@ -82,16 +82,11 @@
                             <span class="info-value">{{ user['credit_card_expiry'] }}</span>
                         </div>
                     </div>
-                    <div class="col-md-3">
-                        <div class="info-field">
-                            <span class="info-label">CVV</span>
-                            <span class="info-value">•••</span>
-                        </div>
-                    </div>
+
                 </div>
             </div>
 
-            <!-- Bio Section (B4: Stored XSS via ) -->
+
             <div class="cyber-card mb-4 animate-in animate-delay-2">
                 <h5 class="card-section-title">
                     <i class="fas fa-terminal me-2 text-green"></i>Bio

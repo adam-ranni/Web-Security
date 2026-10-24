@@ -15,13 +15,13 @@
 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                         <label for="current-edit_profile" class="form-label">Current password (required for account changes)</label><input id="current-edit_profile" type="password" name="current_password" autocomplete="current-password" class="form-control mb-3">
                         <div class="mb-3">
-                            <label class="form-label text-muted">Email</label>
-                            <input type="email" name="email" class="form-control bg-dark text-light border-secondary"
+                            <label for="field-edit_profile-2" class="form-label text-muted">Email</label>
+                            <input id="field-edit_profile-2" type="email" name="email" class="form-control bg-dark text-light border-secondary"
                                    value="{{ user['email'] }}">
                         </div>
                         <div class="mb-3">
-                            <label class="form-label text-muted">Bio</label>
-                            <textarea name="bio" rows="4" class="form-control bg-dark text-light border-secondary"
+                            <label for="field-edit_profile-3" class="form-label text-muted">Bio</label>
+                            <textarea id="field-edit_profile-3" name="bio" rows="4" class="form-control bg-dark text-light border-secondary"
                                       placeholder="Tell us about yourself...">{{ user['bio'] }}</textarea>
                             <small class="text-muted">Plain text only</small>
                         </div>
@@ -47,7 +47,7 @@
                     <form action="{{ url_for('upload_avatar') }}" method="POST" enctype="multipart/form-data">
 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                         <div class="mb-3">
-                            <input type="file" name="avatar" class="form-control bg-dark text-light border-secondary" accept="image/*">
+                            <label class="visually-hidden" for="field-edit_profile-4">Avatar</label><input id="field-edit_profile-4" type="file" name="avatar" class="form-control bg-dark text-light border-secondary" accept="image/*">
                             <small class="text-muted">Upload your profile picture</small>
                         </div>
                         <button type="submit" class="btn btn-outline-info w-100">
@@ -69,8 +69,8 @@
 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                         <label for="current-change_password" class="form-label">Current password (required for account changes)</label><input id="current-change_password" type="password" name="current_password" autocomplete="current-password" class="form-control mb-3">
                         <div class="mb-3">
-                            <label class="form-label text-muted">New Password</label>
-                            <input type="password" name="new_password" class="form-control bg-dark text-light border-secondary" required>
+                            <label for="field-edit_profile-6" class="form-label text-muted">New Password</label>
+                            <input id="field-edit_profile-6" type="password" name="new_password" class="form-control bg-dark text-light border-secondary" required>
                         </div>
                         <button type="submit" class="btn btn-outline-warning">
                             <i class="fas fa-lock me-1"></i>Change Password
@@ -91,8 +91,8 @@
 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                         <label for="current-change_email" class="form-label">Current password (required for account changes)</label><input id="current-change_email" type="password" name="current_password" autocomplete="current-password" class="form-control mb-3">
                         <div class="mb-3">
-                            <label class="form-label text-muted">New Email</label>
-                            <input type="email" name="new_email" class="form-control bg-dark text-light border-secondary" required>
+                            <label for="field-edit_profile-8" class="form-label text-muted">New Email</label>
+                            <input id="field-edit_profile-8" type="email" name="new_email" class="form-control bg-dark text-light border-secondary" required>
                         </div>
                         <button type="submit" class="btn btn-outline-info">
                             <i class="fas fa-envelope me-1"></i>Change Email

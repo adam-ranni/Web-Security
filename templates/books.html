@@ -19,7 +19,7 @@
                 <span class="input-group-text search-icon">
                     <i class="fas fa-terminal text-green"></i>
                 </span>
-                <input type="text" name="search" class="form-control form-control-cyber search-input"
+                <label class="visually-hidden" for="field-books-1">Search</label><input id="field-books-1" type="text" name="search" class="form-control form-control-cyber search-input"
                        placeholder="Search books by title, author, category..."
                        value="{{ search or '' }}" autocomplete="off">
                 <button type="submit" class="btn btn-cyber-filled search-btn">
@@ -29,7 +29,7 @@
         </form>
     </div>
 
-    <!-- Search Results Info (B1: XSS via ) -->
+
     {% if search %}
     <div class="search-results-info mb-4 animate-in">
         <div class="cyber-card" style="padding: 1rem 1.5rem;">

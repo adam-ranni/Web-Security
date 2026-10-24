@@ -107,6 +107,24 @@ def reset_link_command(username):
     click.echo(path.read_text(encoding='utf-8'))
 
 
+@app.cli.command('set-password')
+@click.argument('username')
+@click.password_option(confirmation_prompt=True)
+def set_password_command(username,password):
+    """Locally verify the owner, then activate a migrated account with a NEW password."""
+    valid_password_value=password
+    if not 12<=len(valid_password_value)<=128:
+        raise click.ClickException('Password must contain 12 to 128 characters')
+    with transaction(app.config['DATABASE']) as db:
+        user=db.execute('SELECT id FROM users WHERE username=?',(username,)).fetchone()
+        if not user:
+            raise click.ClickException('Account not found')
+        db.execute('UPDATE users SET password=?,password_reset_required=0,reset_token=NULL,reset_token_expiry=NULL,auth_version=auth_version+1 WHERE id=?',(generate_password_hash(valid_password_value),user['id']))
+        db.execute('DELETE FROM sessions WHERE user_id=?',(user['id'],))
+    (Path(app.config['RESET_OUTBOX'])/str(user['id'])).unlink(missing_ok=True)
+    click.echo('Password changed; existing sessions and tokens revoked')
+
+
 @app.get('/api/csrf')
 def csrf_token_api():
     return jsonify(csrf_token=generate_csrf())
@@ -114,7 +132,7 @@ def csrf_token_api():
 
 @app.errorhandler(HTTPException)
 def http_error(error):
-    message=error.description if error.code in (400,413,429,503) else error.name
+    message=error.description if error.code in (400,409,413,429,503) else error.name
     if request.path.startswith('/api/'):
         return jsonify(error=message),error.code
     return render_template('error.html',error_code=error.code,error_message=message),error.code
@@ -151,6 +169,7 @@ def logout():
 @app.route('/register',methods=['GET','POST'])
 def register():
     if request.method=='POST':
+        limit_action('registration',10)
         username=text(request.form.get('username',''),32)
         if not re.fullmatch(r'[A-Za-z0-9_]{3,32}',username):
             abort(400,description='Username must contain 3 to 32 letters, digits or underscores')
@@ -158,11 +177,14 @@ def register():
         password=valid_password(request.form.get('password',''))
         if password!=request.form.get('confirm_password'):
             abort(400,description='Passwords do not match')
+        card=text(request.form.get('credit_card_number',''),4,required=False)
+        if card and not re.fullmatch(r'[0-9]{4}',card):
+            abort(400,description='Provide only four demo card digits')
         expiry=text(request.form.get('credit_card_expiry',''),5,required=False)
         if expiry and not re.fullmatch(r'(0[1-9]|1[0-2])/[0-9]{2}',expiry):
             abort(400,description='Invalid expiry')
         try:
-            write('INSERT INTO users (username,email,password,credit_card_number,credit_card_expiry) VALUES (?,?,?,?,?)',(username,address,generate_password_hash(password),mask_card(request.form.get('credit_card_number','')),expiry))
+            write('INSERT INTO users (username,email,password,credit_card_number,credit_card_expiry) VALUES (?,?,?,?,?)',(username,address,generate_password_hash(password),mask_card(card),expiry))
         except sqlite3.IntegrityError:
             flash('Registration could not be completed with those details.','danger')
             return render_template('register.html'),400
@@ -202,7 +224,7 @@ def reset_password(token):
         if password!=request.form.get('confirm_password'):
             abort(400,description='Passwords do not match')
         with transaction(app.config['DATABASE']) as db:
-            changed=db.execute('UPDATE users SET password=?,reset_token=NULL,reset_token_expiry=NULL,auth_version=auth_version+1 WHERE reset_token=? AND reset_token_expiry>? AND is_active=1',(generate_password_hash(password),hashed,now)).rowcount
+            changed=db.execute('UPDATE users SET password=?,reset_token=NULL,reset_token_expiry=NULL,password_reset_required=0,auth_version=auth_version+1 WHERE reset_token=? AND reset_token_expiry>? AND is_active=1',(generate_password_hash(password),hashed,now)).rowcount
             if changed!=1:
                 abort(400)
             db.execute('DELETE FROM sessions WHERE user_id=?',(user['id'],))
@@ -212,14 +234,9 @@ def reset_password(token):
     return render_template('reset_password.html',token=token)
 
 
-@app.route('/')
+@app.get('/')
 def index():
-    conn = get_shop_db()
-    c = conn.cursor()
-    c.execute('SELECT * FROM books')
-    books = c.fetchall()
-    conn.close()
-    return render_template('index.html', books=books)
+    return render_template('index.html',books=rows('SELECT * FROM books ORDER BY id'))
 
 
 @app.get('/books')
@@ -270,7 +287,7 @@ def change_password():
     current_password()
     password=valid_password(request.form.get('new_password',''))
     with transaction(app.config['DATABASE']) as db:
-        db.execute('UPDATE users SET password=?,auth_version=auth_version+1 WHERE id=?',(generate_password_hash(password),g.user['id']))
+        db.execute('UPDATE users SET password=?,password_reset_required=0,auth_version=auth_version+1 WHERE id=?',(generate_password_hash(password),g.user['id']))
         db.execute('DELETE FROM sessions WHERE user_id=?',(g.user['id'],))
     end_session()
     return redirect(url_for('login'))
@@ -291,6 +308,8 @@ def change_email():
 @login_required
 def delete_account():
     current_password()
+    if g.user['role']=='admin' and one("SELECT COUNT(*) AS n FROM users WHERE role='admin' AND is_active=1")['n']<=1:
+        abort(409,description='Create another administrator before deactivating this account')
     with transaction(app.config['DATABASE']) as db:
         db.execute('UPDATE users SET is_active=0,auth_version=auth_version+1 WHERE id=?',(g.user['id'],))
         db.execute('DELETE FROM sessions WHERE user_id=?',(g.user['id'],))
@@ -452,36 +471,20 @@ def transfer_balance():
     return render_template('transfer.html',user=g.user)
 
 
-@app.route('/support')
+@app.get('/support')
 @login_required
 def support_tickets():
-    conn = get_shop_db()
-    c = conn.cursor()
-    c.execute('SELECT * FROM support_tickets WHERE user_id = ? ORDER BY created_at DESC',
-              (session['user_id'],))
-    tickets = c.fetchall()
-    conn.close()
-    return render_template('support_tickets.html', tickets=tickets)
+    tickets=rows('SELECT * FROM support_tickets WHERE user_id=? ORDER BY created_at DESC,id DESC',(g.user['id'],))
+    return render_template('support_tickets.html',tickets=tickets)
 
 
-@app.route('/support/new', methods=['GET', 'POST'])
+@app.route('/support/new',methods=['GET','POST'])
 @login_required
 def new_ticket():
-    if request.method == 'POST':
-        subject = request.form.get('subject', '')
-        message = request.form.get('message', '')
-
-        conn = get_shop_db()
-        c = conn.cursor()
-        c.execute('''INSERT INTO support_tickets (user_id, subject, message)
-                    VALUES (?, ?, ?)''',
-                 (session['user_id'], subject, message))
-        conn.commit()
-        conn.close()
-
-        flash('Support ticket submitted!', 'success')
+    if request.method=='POST':
+        limit_action('support',20)
+        write('INSERT INTO support_tickets (user_id,subject,message) VALUES (?,?,?)',(g.user['id'],text(request.form.get('subject',''),200),text(request.form.get('message',''),4000)))
         return redirect(url_for('support_tickets'))
-
     return render_template('new_ticket.html')
 
 
@@ -570,122 +573,43 @@ def api_load_cart():
         abort(400,description='Invalid JSON cart')
 
 
-@app.route('/admin')
+@app.get('/admin')
 @admin_required
 def admin_dashboard():
-    # Get stats
-    uconn = get_user_db()
-    uc = uconn.cursor()
-    uc.execute('SELECT COUNT(*) as cnt FROM users')
-    total_users = uc.fetchone()['cnt']
-    uc.execute('SELECT * FROM users ORDER BY created_at DESC LIMIT 5')
-    recent_users = uc.fetchall()
-    uconn.close()
-
-    sconn = get_shop_db()
-    sc = sconn.cursor()
-    sc.execute('SELECT COUNT(*) as cnt FROM books')
-    total_books = sc.fetchone()['cnt']
-    sc.execute('SELECT COUNT(*) as cnt FROM orders')
-    total_orders = sc.fetchone()['cnt']
-    sc.execute('SELECT COALESCE(SUM(total), 0) as rev FROM orders')
-    total_revenue = sc.fetchone()['rev']
-    sc.execute('SELECT * FROM orders ORDER BY created_at DESC LIMIT 5')
-    recent_orders = sc.fetchall()
-
-    # Get open tickets count
-    sc.execute("SELECT COUNT(*) as cnt FROM support_tickets WHERE status = 'open'")
-    open_tickets = sc.fetchone()['cnt']
-    sconn.close()
-
-    stats = {
-        'total_users': total_users,
-        'total_books': total_books,
-        'total_orders': total_orders,
-        'total_revenue': total_revenue,
-        'open_tickets': open_tickets,
-    }
-
-    return render_template('admin_dashboard.html', stats=stats,
-                          recent_orders=recent_orders, recent_users=recent_users)
+    stats=dict(total_users=one('SELECT COUNT(*) AS n FROM users')['n'],total_books=one('SELECT COUNT(*) AS n FROM books')['n'],total_orders=one('SELECT COUNT(*) AS n FROM orders')['n'],total_revenue=one('SELECT COALESCE(SUM(total_cents),0) AS n FROM orders')['n']/100,open_tickets=one("SELECT COUNT(*) AS n FROM support_tickets WHERE status='open'")['n'])
+    recent_users=rows('SELECT id,username,email,role,created_at FROM users ORDER BY id DESC LIMIT 5')
+    recent_orders=rows('SELECT * FROM orders ORDER BY id DESC LIMIT 5')
+    return render_template('admin_dashboard.html',stats=stats,recent_users=recent_users,recent_orders=recent_orders)
 
 
-@app.route('/admin/users')
+@app.get('/admin/users')
 @admin_required
 def admin_users():
-    """F6 вЂ” Forced browsing: URL directly accessible if role check bypassed."""
-    conn = get_user_db()
-    c = conn.cursor()
-    c.execute('SELECT * FROM users ORDER BY id')
-    users = c.fetchall()
-    conn.close()
-    return render_template('admin_users.html', users=users)
+    users=rows('SELECT id,username,email,role,balance,credit_card_number,is_active FROM users ORDER BY id')
+    return render_template('admin_users.html',users=users)
 
 
-@app.route('/admin/logs')
+@app.get('/admin/logs')
 @admin_required
 def admin_logs():
-    conn = get_shop_db()
-    c = conn.cursor()
-    c.execute('SELECT * FROM admin_logs ORDER BY created_at DESC LIMIT 100')
-    logs = c.fetchall()
-    conn.close()
-
-    # Enrich with usernames
-    uconn = get_user_db()
-    uc = uconn.cursor()
-    enriched_logs = []
-    for log in logs:
-        uc.execute('SELECT username FROM users WHERE id = ?', (log['admin_id'],))
-        admin = uc.fetchone()
-        enriched_logs.append({
-            'id': log['id'],
-            'admin_username': admin['username'] if admin else 'Unknown',
-            'action': log['action'],
-            'details': log['details'],
-            'created_at': log['created_at'],
-        })
-    uconn.close()
-
-    return render_template('admin_logs.html', logs=enriched_logs)
+    logs=rows('SELECT admin_logs.*,users.username AS admin_username FROM admin_logs LEFT JOIN users ON users.id=admin_logs.admin_id ORDER BY admin_logs.id DESC LIMIT 100')
+    return render_template('admin_logs.html',logs=logs)
 
 
-@app.route('/admin/tickets')
+@app.get('/admin/tickets')
 @admin_required
 def admin_tickets():
-    conn = get_shop_db()
-    c = conn.cursor()
-    c.execute('SELECT * FROM support_tickets ORDER BY created_at DESC')
-    tickets = c.fetchall()
-    conn.close()
-
-    # Enrich with usernames
-    uconn = get_user_db()
-    uc = uconn.cursor()
-    enriched = []
-    for t in tickets:
-        uc.execute('SELECT username FROM users WHERE id = ?', (t['user_id'],))
-        u = uc.fetchone()
-        enriched.append({**dict(t), 'username': u['username'] if u else 'Unknown'})
-    uconn.close()
-
-    return render_template('admin_tickets.html', tickets=enriched)
+    tickets=rows('SELECT support_tickets.*,users.username FROM support_tickets JOIN users ON users.id=support_tickets.user_id ORDER BY support_tickets.id DESC')
+    return render_template('admin_tickets.html',tickets=tickets)
 
 
-@app.route('/admin/ticket/<int:ticket_id>/reply', methods=['POST'])
+@app.post('/admin/ticket/<int:ticket_id>/reply')
 @admin_required
 def admin_reply_ticket(ticket_id):
-    reply = request.form.get('reply', '')
-    conn = get_shop_db()
-    c = conn.cursor()
-    # A6 вЂ” Second-order SQLi potential: admin_reply stored, could be reflected elsewhere
-    c.execute("UPDATE support_tickets SET admin_reply = ?, status = 'closed' WHERE id = ?",
-              (reply, ticket_id))
-    conn.commit()
-    conn.close()
-
-    log_admin_action(session['user_id'], 'reply_ticket', details=f'Ticket #{ticket_id}')
-    flash('Reply sent.', 'success')
+    reply=text(request.form.get('reply',''),4000)
+    if write("UPDATE support_tickets SET admin_reply=?,status='closed' WHERE id=?",(reply,ticket_id))!=1:
+        abort(404)
+    log_admin_action(g.user['id'],'reply_ticket',details=f'Ticket #{ticket_id}')
     return redirect(url_for('admin_tickets'))
 
 

@@ -71,13 +71,13 @@
 
                 <hr class="divider">
 
-                <!-- Add to Cart Form (K1: allows negative quantity) -->
+
                 <form action="/add_to_cart/{{ book['id'] }}" method="POST" class="add-to-cart-form">
 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                     <div class="row align-items-end g-3">
                         <div class="col-auto">
-                            <label class="form-label-cyber">Quantity</label>
-                            <input type="number" name="quantity" class="form-control form-control-cyber qty-input"
+                            <label for="field-book_details-1" class="form-label-cyber">Quantity</label>
+                            <input id="field-book_details-1" type="number" name="quantity" class="form-control form-control-cyber qty-input"
                                    value="1" style="width: 100px;">
                         </div>
                         <div class="col">
@@ -116,7 +116,7 @@
                         {% endfor %}
                     </div>
                 </div>
-                <!-- B2: Stored XSS via  on review comment -->
+
                 <div class="review-comment">{{ review['comment'] }}</div>
                 {% if review['created_at'] %}
                 <div class="review-date mt-2">
@@ -145,8 +145,8 @@
                 <form action="/review/{{ book['id'] }}" method="POST">
 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                     <div class="mb-3">
-                        <label class="form-label-cyber">Rating</label>
-                        <select name="rating" class="form-select form-select-cyber" required>
+                        <label for="field-book_details-2" class="form-label-cyber">Rating</label>
+                        <select id="field-book_details-2" name="rating" class="form-select form-select-cyber" required>
                             <option value="" disabled selected>Select rating...</option>
                             <option value="5">★★★★★ — Exceptional</option>
                             <option value="4">★★★★☆ — Great</option>
@@ -156,8 +156,8 @@
                         </select>
                     </div>
                     <div class="mb-3">
-                        <label class="form-label-cyber">Comment</label>
-                        <textarea name="comment" class="form-control form-control-cyber" rows="4"
+                        <label for="field-book_details-3" class="form-label-cyber">Comment</label>
+                        <textarea id="field-book_details-3" name="comment" class="form-control form-control-cyber" rows="4"
                                   placeholder="Share your thoughts on this book..." required></textarea>
                     </div>
                     <button type="submit" class="btn btn-cyber-filled">

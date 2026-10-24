@@ -30,3 +30,6 @@ node_modules/
 
 # Local audit / verification notes (not for version control)
 dv-bookshop-vuln-verification.md
+
+# Fixed shop local runtime data (not source)
+/instance/

@@ -1,5 +1,7 @@
 """Explicit initialization and copy-only migration to a transactional shop database."""
 import sqlite3
+import os
+import secrets
 from contextlib import closing, contextmanager
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
@@ -14,6 +16,7 @@ CREATE TABLE users (
  balance REAL GENERATED ALWAYS AS (balance_cents/100.0) VIRTUAL,
  secret_note TEXT DEFAULT '', profile_pic TEXT NOT NULL DEFAULT 'default.png', bio TEXT DEFAULT '',
  reset_token TEXT UNIQUE, reset_token_expiry INTEGER, auth_version INTEGER NOT NULL DEFAULT 0,
+ password_reset_required INTEGER NOT NULL DEFAULT 0 CHECK(password_reset_required IN (0,1)),
  is_active INTEGER NOT NULL DEFAULT 1 CHECK(is_active IN (0,1)), created_at TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE books (
  id INTEGER PRIMARY KEY, title TEXT NOT NULL, author TEXT NOT NULL,
@@ -74,7 +77,9 @@ def initialize(path, admin_password, books, coupons):
         raise ValueError('Database already exists; use a new output path')
     if not 12<=len(admin_password)<=128:
         raise ValueError('Admin password must contain 12 to 128 characters')
-    target.parent.mkdir(parents=True,exist_ok=True)
+    target.parent.mkdir(parents=True,exist_ok=True,mode=0o700)
+    descriptor=os.open(target,os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600)
+    os.close(descriptor)
     with closing(sqlite3.connect(target)) as db:
         db.executescript(SCHEMA)
         db.execute('INSERT INTO users (username,email,password,role) VALUES (?,?,?,?)',('admin','admin@example.invalid',generate_password_hash(admin_password),'admin'))
@@ -90,10 +95,10 @@ def migrate(users_path, shop_path, output):
     sources=[Path(p).resolve(strict=True) for p in (users_path,shop_path)]
     if output in sources or output.exists():
         raise ValueError('Output must be a new database, separate from both inputs')
-    temporary=output.with_name(output.name+'.migrating')
-    if temporary.exists():
-        raise ValueError('Migration staging file already exists')
-    output.parent.mkdir(parents=True,exist_ok=True)
+    temporary=output.with_name(output.name+'.migrating-'+secrets.token_hex(8))
+    output.parent.mkdir(parents=True,exist_ok=True,mode=0o700)
+    descriptor=os.open(temporary,os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600)
+    os.close(descriptor)
     try:
         with closing(sqlite3.connect(temporary)) as dest:
             dest.executescript(SCHEMA)
@@ -103,7 +108,7 @@ def migrate(users_path, shop_path, output):
                 for row in source.execute('SELECT * FROM users'):
                     d=dict(row); stored=d['password']
                     password=stored if stored.startswith(('scrypt:','pbkdf2:')) else generate_password_hash(stored)
-                    dest.execute('INSERT INTO users (id,username,email,password,role,credit_card_number,credit_card_expiry,balance_cents,secret_note,bio,is_active,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',(d['id'],d['username'],d['email'].lower(),password,d['role'],mask_card(d['credit_card_number']),d['credit_card_expiry'],cents(d['balance']),d['secret_note'],d['bio'],d['is_active'],d['created_at']))
+                    dest.execute('INSERT INTO users (id,username,email,password,role,credit_card_number,credit_card_expiry,balance_cents,secret_note,bio,is_active,created_at,password_reset_required) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,1)',(d['id'],d['username'],d['email'].lower(),password,d['role'],mask_card(d['credit_card_number']),d['credit_card_expiry'],cents(d['balance']),d['secret_note'],d['bio'],d['is_active'],d['created_at']))
             with closing(sqlite3.connect(sources[1].as_uri()+'?mode=ro',uri=True)) as source:
                 source.row_factory=sqlite3.Row
                 for table in ('books','cart','orders','order_items','reviews','coupons','support_tickets','uploaded_files','admin_logs'):
@@ -121,7 +126,8 @@ def migrate(users_path, shop_path, output):
             if dest.execute('PRAGMA foreign_key_check').fetchone():
                 raise ValueError('Legacy data contains orphan references')
             dest.commit()
-        temporary.rename(output)
+        os.link(temporary,output)
+        temporary.unlink()
     except BaseException:
         temporary.unlink(missing_ok=True)
         raise

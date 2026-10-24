@@ -14,7 +14,7 @@
 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                         <div class="input-group">
                             <span class="input-group-text bg-dark text-success border-secondary">$</span>
-                            <input type="text" name="host" class="form-control bg-dark text-light border-secondary font-monospace" 
+                            <label class="visually-hidden" for="field-admin_ping-1">Host</label><input id="field-admin_ping-1" type="text" name="host" class="form-control bg-dark text-light border-secondary font-monospace"
                                    placeholder="Enter hostname (e.g., 127.0.0.1)" required>
                             <button type="submit" class="btn btn-outline-success">
                                 <i class="fas fa-play me-1"></i>Ping

@@ -12,6 +12,8 @@
                 </div>
                 <div class="card-body">
                     <form action="{{ url_for('edit_profile') }}" method="POST">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                        <label for="current-edit_profile" class="form-label">Current password (required for account changes)</label><input id="current-edit_profile" type="password" name="current_password" autocomplete="current-password" class="form-control mb-3">
                         <div class="mb-3">
                             <label class="form-label text-muted">Email</label>
                             <input type="email" name="email" class="form-control bg-dark text-light border-secondary" 
@@ -21,7 +23,7 @@
                             <label class="form-label text-muted">Bio</label>
                             <textarea name="bio" rows="4" class="form-control bg-dark text-light border-secondary" 
                                       placeholder="Tell us about yourself...">{{ user['bio'] }}</textarea>
-                            <small class="text-muted">Supports HTML formatting</small>
+                            <small class="text-muted">Plain text only</small>
                         </div>
                         <button type="submit" class="btn btn-outline-success">
                             <i class="fas fa-save me-1"></i>Save Changes
@@ -43,6 +45,7 @@
                              alt="Avatar" class="rounded-circle" style="width:100px;height:100px;object-fit:cover;border:2px solid rgba(0,255,65,0.3);">
                     </div>
                     <form action="{{ url_for('upload_avatar') }}" method="POST" enctype="multipart/form-data">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                         <div class="mb-3">
                             <input type="file" name="avatar" class="form-control bg-dark text-light border-secondary" accept="image/*">
                             <small class="text-muted">Upload your profile picture</small>
@@ -63,6 +66,8 @@
                 </div>
                 <div class="card-body">
                     <form action="{{ url_for('change_password') }}" method="POST">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                        <label for="current-change_password" class="form-label">Current password (required for account changes)</label><input id="current-change_password" type="password" name="current_password" autocomplete="current-password" class="form-control mb-3">
                         <div class="mb-3">
                             <label class="form-label text-muted">New Password</label>
                             <input type="password" name="new_password" class="form-control bg-dark text-light border-secondary" required>
@@ -83,6 +88,8 @@
                 </div>
                 <div class="card-body">
                     <form action="{{ url_for('change_email') }}" method="POST">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                        <label for="current-change_email" class="form-label">Current password (required for account changes)</label><input id="current-change_email" type="password" name="current_password" autocomplete="current-password" class="form-control mb-3">
                         <div class="mb-3">
                             <label class="form-label text-muted">New Email</label>
                             <input type="email" name="new_email" class="form-control bg-dark text-light border-secondary" required>
@@ -104,6 +111,8 @@
                 <div class="card-body">
                     <p class="text-muted">Once you delete your account, there is no going back.</p>
                     <form action="{{ url_for('delete_account') }}" method="POST" class="danger-confirm">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                        <label for="current-delete_account" class="form-label">Current password (required for account changes)</label><input id="current-delete_account" type="password" name="current_password" autocomplete="current-password" class="form-control mb-3">
                         <button type="submit" class="btn btn-outline-danger">
                             <i class="fas fa-trash me-1"></i>Delete Account
                         </button>

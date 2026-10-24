@@ -15,6 +15,7 @@
                         <span class="fs-2 fw-bold" style="color:#00ff41;">${{ "%.2f"|format(user['balance']) }}</span>
                     </div>
                     <form action="{{ url_for('transfer_balance') }}" method="POST">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                         <div class="mb-3">
                             <label class="form-label text-muted">Recipient Username</label>
                             <input type="text" name="recipient" class="form-control bg-dark text-light border-secondary" 

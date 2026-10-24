@@ -11,6 +11,7 @@
                 </div>
                 <div class="card-body">
                     <form action="{{ url_for('admin_preview_url') }}" method="POST" class="mb-4">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                         <div class="input-group">
                             <input type="text" name="url" class="form-control bg-dark text-light border-secondary" 
                                    placeholder="Enter URL to preview (e.g., http://example.com)" required>

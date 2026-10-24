@@ -1,829 +1,212 @@
-from flask import (
-    Flask, render_template, request, redirect, url_for,
-    flash, session, jsonify, make_response, send_file,
-    send_from_directory, abort, Response
-)
-import sqlite3
-import os
-import hashlib
-import hmac
-import time
-import pickle
-import base64
-import subprocess
+"""Fixed DV Bookshop. Initialize or migrate data explicitly before serving."""
+import csv
+import io
 import json
+import os
 import re
-from functools import wraps
-from datetime import datetime, timedelta
-from urllib.parse import urlparse
-from urllib.request import urlopen
-from xml.etree import ElementTree as ET
-from lxml import etree
+import secrets
+import sqlite3
+import time
+from contextlib import closing
+from pathlib import Path
 
-# ============================================================
-# APP CONFIGURATION
-# ============================================================
+import click
+import jwt
+from flask import Flask, abort, flash, g, jsonify, make_response, redirect, render_template, request, session, url_for
+from flask_wtf.csrf import CSRFError, generate_csrf
+from werkzeug.exceptions import HTTPException
+from werkzeug.security import generate_password_hash
 
-app = Flask(__name__)
-# J5 — Hardcoded secret key (Sensitive Data Exposure)
-# F1 — Broken access control: the secret key is hardcoded and public (it's
-# committed to source control), so anyone who reads this file can use
-# Flask's own session-signing library (itsdangerous) to forge a validly
-# signed session cookie with role='admin' -- a full authentication bypass
-# that works even when every other /lab toggle is set to SECURE.
-app.secret_key = 'bookshop_secret_key_2025_khitminnyo'
+from catalog_seed import BOOKS, COUPONS
+from storage import cents, initialize, mask_card, migrate, transaction
+from shop_security import (admin_required, authenticate, configure, current_password,
+    database, digest, email, end_session, login_required, one, positive_int,
+    rows, limit_action, safe_redirect, start_session, text, token_identity, valid_password, write)
 
-# F3 — Session cookie missing Secure/HttpOnly flags
-app.config['SESSION_COOKIE_HTTPONLY'] = False
-app.config['SESSION_COOKIE_SECURE'] = False
-app.config['SESSION_COOKIE_SAMESITE'] = None
+app=Flask(__name__)
+configure(app)
 
-# L2 — HTTP header injection / response splitting via /set_language?lang=.
-# Werkzeug >=2.1 rejects header values containing \r or \n by default (a
-# fix for HTTP response splitting), which silently turned this exercise
-# into a dead end. We deliberately restore the old, permissive behavior
-# here so the lab is genuinely exploitable again on current dependencies.
-import werkzeug.datastructures.headers as _wh_headers
-
-
-def _insecure_str_header_value(value):
-    if not isinstance(value, str):
-        value = str(value)
-    return value
-
-
-_wh_headers._str_header_value = _insecure_str_header_value
-
-UPLOAD_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static', 'uploads')
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-
-USER_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'users.db')
-SHOP_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bookshop.db')
-RACE_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'race_lab.db')
-
-STATIC_RESET_SECRET = 'khitminnyo2025'  # Used for predictable password reset tokens (E1)
-
-# JWT signing secret — intentionally weak / brute-forceable (JWT module)
-JWT_SECRET = 'secret'
-
-
-# ============================================================
-# LAB CONFIG — Difficulty Toggle (secure / insecure mode)
-# ============================================================
-# Each vulnerability can be independently switched between "insecure"
-# (vulnerable, default) and "secure" (patched) so instructors can show
-# before/after behaviour without editing code. State is persisted to a
-# JSON file so it survives restarts.
-
-LAB_CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'lab_config.json')
-
-# vuln_id -> secure? (False = vulnerable/insecure = default lab behaviour)
-DEFAULT_LAB_CONFIG = {
-    'A5_sqli_login': False,     # SQL injection in /login
-    'A7_sqli_search': False,    # SQL injection in /books search
-    'B1_xss_search': False,     # Reflected XSS in search results
-    'D1_idor_profile': False,   # IDOR in /profile?user_id=
-    'E2_rate_limit': False,     # Login brute-force protection (True = protected)
-    'JWT_verify': False,        # JWT signature/alg verification (True = enforced)
-}
-
-# Human-readable labels for the /lab control panel
-LAB_LABELS = {
-    'A5_sqli_login':  ('A5', 'SQL Injection — Login bypass'),
-    'A7_sqli_search': ('A7', 'SQL Injection — Book search'),
-    'B1_xss_search':  ('B1', 'Reflected XSS — Search page'),
-    'D1_idor_profile':('D1', 'IDOR — Profile viewing'),
-    'E2_rate_limit':  ('E2', 'Login rate-limiting (brute-force)'),
-    'JWT_verify':     ('JWT', 'JWT signature & alg verification'),
-}
-
-
-def load_lab_config():
-    """Load lab config from disk, filling in any missing defaults."""
-    cfg = dict(DEFAULT_LAB_CONFIG)
-    try:
-        with open(LAB_CONFIG_FILE, 'r') as f:
-            saved = json.load(f)
-        for k, v in saved.items():
-            if k in cfg:
-                cfg[k] = bool(v)
-    except (FileNotFoundError, ValueError):
-        pass
-    return cfg
-
-
-def save_lab_config(cfg):
-    """Persist lab config to disk."""
-    with open(LAB_CONFIG_FILE, 'w') as f:
-        json.dump(cfg, f, indent=2)
-
-
-def is_secure(vuln_id):
-    """Return True if the given vuln is currently in SECURE (patched) mode."""
-    return load_lab_config().get(vuln_id, False)
-
-
-# Rate-limit tracking (in-memory; resets when the server restarts).
-# username -> {'count': int, 'first': ts, 'locked_until': ts}
-LOGIN_ATTEMPTS = {}
-RATE_LIMIT_MAX = 5          # attempts allowed before lockout (secure mode)
-RATE_LIMIT_WINDOW = 300     # seconds the counter is measured over
-RATE_LIMIT_LOCKOUT = 120    # lockout duration in seconds
-
-
-def record_login_attempt(username, success):
-    """Track failed login attempts per username. Returns current attempt info."""
-    now = time.time()
-    info = LOGIN_ATTEMPTS.get(username)
-    if info is None or (now - info['first']) > RATE_LIMIT_WINDOW:
-        info = {'count': 0, 'first': now, 'locked_until': 0}
-    if success:
-        # Clear the counter on a successful login
-        LOGIN_ATTEMPTS.pop(username, None)
-        return {'count': 0, 'remaining': RATE_LIMIT_MAX, 'locked_until': 0}
-    info['count'] += 1
-    if is_secure('E2_rate_limit') and info['count'] >= RATE_LIMIT_MAX:
-        info['locked_until'] = now + RATE_LIMIT_LOCKOUT
-    LOGIN_ATTEMPTS[username] = info
-    remaining = max(0, RATE_LIMIT_MAX - info['count'])
-    return {'count': info['count'], 'remaining': remaining, 'locked_until': info['locked_until']}
-
-
-def is_locked_out(username):
-    """In secure mode, return seconds remaining on lockout (0 if not locked)."""
-    if not is_secure('E2_rate_limit'):
-        return 0
-    info = LOGIN_ATTEMPTS.get(username)
-    if not info:
-        return 0
-    remaining = info.get('locked_until', 0) - time.time()
-    return int(remaining) if remaining > 0 else 0
-
-
-# ============================================================
-# JWT HELPERS (dependency-free, intentionally vulnerable)
-# ============================================================
-
-def _b64url_encode(data):
-    return base64.urlsafe_b64encode(data).rstrip(b'=').decode()
-
-
-def _b64url_decode(s):
-    pad = '=' * (-len(s) % 4)
-    return base64.urlsafe_b64decode(s + pad)
-
-
-def jwt_encode(payload, secret=JWT_SECRET, alg='HS256'):
-    """Create a signed JWT (HS256) or an unsigned one (alg='none')."""
-    header = {'alg': alg, 'typ': 'JWT'}
-    h = _b64url_encode(json.dumps(header, separators=(',', ':')).encode())
-    p = _b64url_encode(json.dumps(payload, separators=(',', ':')).encode())
-    signing_input = f'{h}.{p}'.encode()
-    if alg == 'none':
-        return f'{h}.{p}.'
-    sig = hmac.new(secret.encode(), signing_input, hashlib.sha256).digest()
-    return f'{h}.{p}.{_b64url_encode(sig)}'
-
-
-def jwt_decode(token):
-    """Decode a JWT.
-
-    INSECURE by default (JWT_verify off): trusts the header's 'alg'. If the
-    token says alg='none' it is accepted with NO signature check, and HS256
-    tokens are verified against a weak, guessable secret.
-
-    SECURE mode (JWT_verify on): only HS256 is accepted and the signature
-    must validate; alg='none' is rejected.
-    """
-    parts = token.split('.')
-    if len(parts) != 3:
-        raise ValueError('Malformed token')
-    h_raw, p_raw, sig = parts
-    header = json.loads(_b64url_decode(h_raw))
-    payload = json.loads(_b64url_decode(p_raw))
-    alg = header.get('alg', '')
-    secure = is_secure('JWT_verify')
-
-    if alg == 'none':
-        if secure:
-            raise ValueError('alg=none is not allowed')
-        return payload  # VULN: unsigned token trusted
-
-    if alg != 'HS256':
-        raise ValueError('Unsupported algorithm')
-
-    expected = _b64url_encode(
-        hmac.new(JWT_SECRET.encode(), f'{h_raw}.{p_raw}'.encode(), hashlib.sha256).digest()
-    )
-    if not hmac.compare_digest(expected, sig):
-        raise ValueError('Invalid signature')
-    return payload
-
-
-# ============================================================
-# DATABASE HELPERS
-# ============================================================
 
 def get_user_db():
-    """Connect to persistent user database."""
-    conn = sqlite3.connect(USER_DB)
-    conn.row_factory = sqlite3.Row
-    return conn
+    return database()
 
 
 def get_shop_db():
-    """Connect to resettable shop database."""
-    conn = sqlite3.connect(SHOP_DB)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def init_user_db():
-    """Initialize persistent user database. Only seeds if empty."""
-    conn = get_user_db()
-    c = conn.cursor()
-
-    # J1 — Sensitive data exposure: passwords (see F2) and full payment
-    # card data, including the CVV, are stored in plaintext with no
-    # hashing/encryption/tokenization at all -- a PCI-DSS violation in
-    # any real system (card issuers explicitly forbid storing the CVV).
-    c.execute('''CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT UNIQUE NOT NULL,
-        email TEXT UNIQUE NOT NULL,
-        password TEXT NOT NULL,
-        role TEXT DEFAULT 'user',
-        credit_card_number TEXT,
-        credit_card_expiry TEXT,
-        credit_card_cvv TEXT,
-        balance REAL DEFAULT 1000.0,
-        secret_note TEXT DEFAULT '',
-        profile_pic TEXT DEFAULT 'default.png',
-        bio TEXT DEFAULT '',
-        reset_token TEXT,
-        reset_token_expiry TEXT,
-        is_active INTEGER DEFAULT 1,
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP
-    )''')
-
-    c.execute('SELECT COUNT(*) as cnt FROM users')
-    if c.fetchone()['cnt'] == 0:
-        users = [
-            ('admin', 'admin@bookshop.com', 'SuperSecurePass2025!', 'admin',
-             '4532-0000-0000-0001', '12/27', '999', 9999.0,
-             'CTF{Bl1nd_SQL1_M4st3r_T1m3_B4s3d_2025}', 'default.png', 'System Administrator', None, None, 1),
-            ('alice_hacker', 'alice@hack.com', 'password123', 'user',
-             '4532-1234-5678-9012', '12/25', '123', 1500.0,
-             'Just a regular note', 'default.png', 'Love reading hacking books!', None, None, 1),
-            ('bob_secure', 'bob@secure.net', 'bob2025secure', 'user',
-             '4532-9876-5432-1098', '03/26', '456', 2000.0,
-             'Nothing special here', 'default.png', 'Security enthusiast', None, None, 1),
-            ('charlie_cyber', 'charlie@cyber.org', 'charlie789!', 'user',
-             '4532-4567-8901-2345', '06/25', '789', 1200.0,
-             'My secret shopping list', 'default.png', 'Cyber defense specialist', None, None, 1),
-            ('david_code', 'david@code.com', 'david_pass_abc', 'user',
-             '4532-3456-7890-1234', '09/26', '012', 1800.0,
-             'Remember to update password', 'default.png', 'Code monkey', None, None, 1),
-            ('eve_binary', 'eve@binary.net', 'eve_def_456', 'user',
-             '4532-2345-6789-0123', '11/25', '345', 2500.0,
-             'Binary is life!', 'default.png', 'Reverse engineer', None, None, 1),
-            ('frank_root', 'frank@root.io', 'fr4nk_r00t!', 'moderator',
-             '4916-1111-2222-3333', '05/27', '567', 3000.0,
-             'Moderator secrets here', 'default.png', 'System moderator', None, None, 1),
-            ('grace_shell', 'grace@shell.com', 'gr4ce_sh3ll', 'user',
-             '4916-4444-5555-6666', '08/26', '890', 800.0,
-             'Shell scripting is fun', 'default.png', 'Shell enthusiast', None, None, 1),
-            ('heidi_crypto', 'heidi@crypto.dev', 'h3idi_crypt0', 'user',
-             '4916-7777-8888-9999', '02/27', '234', 1100.0,
-             'Cryptography notes', 'default.png', 'Crypto researcher', None, None, 1),
-            ('ivan_net', 'ivan@network.org', 'iv4n_n3tw0rk', 'user',
-             '4539-0000-1111-2222', '07/26', '678', 950.0,
-             'Network diagrams stored locally', 'default.png', 'Network admin', None, None, 1),
-            ('judy_exploit', 'judy@exploit.io', 'judy_3xpl0it!', 'user',
-             '4539-3333-4444-5555', '10/26', '901', 1600.0,
-             'Exploit development journal', 'default.png', 'Exploit developer', None, None, 1),
-            ('kevin_malware', 'kevin@malware.net', 'k3vin_m4lw4r3', 'user',
-             '4539-6666-7777-8888', '01/27', '345', 2200.0,
-             'Malware analysis reports', 'default.png', 'Malware analyst', None, None, 1),
-            ('lisa_pentest', 'lisa@pentest.com', 'l1sa_p3nt3st', 'user',
-             '4556-1234-0000-1111', '04/27', '678', 1750.0,
-             'Pentest methodology notes', 'default.png', 'Penetration tester', None, None, 1),
-            ('mike_debug', 'mike@debug.io', 'm1ke_d3bug!', 'user',
-             '4556-2222-3333-4444', '06/26', '012', 900.0,
-             'Debugging is an art', 'default.png', 'Bug hunter', None, None, 1),
-            ('nancy_recon', 'nancy@recon.org', 'n4ncy_r3c0n', 'user',
-             '4556-5555-6666-7777', '09/27', '345', 1400.0,
-             'OSINT techniques', 'default.png', 'Recon specialist', None, None, 1),
-            ('oscar_phish', 'oscar@phish.net', '0sc4r_ph1sh', 'user',
-             '4485-0000-1111-2222', '11/26', '678', 1050.0,
-             'Social engineering notes', 'default.png', 'Social engineer', None, None, 1),
-            ('pat_bruteforce', 'pat@bruteforce.io', 'p4t_brut3!', 'user',
-             '4485-3333-4444-5555', '03/27', '901', 1900.0,
-             'Wordlist collection', 'default.png', 'Brute force specialist', None, None, 1),
-            ('quinn_overflow', 'quinn@overflow.com', 'qu1nn_0v3rfl0w', 'user',
-             '4485-6666-7777-8888', '05/26', '234', 2100.0,
-             'Buffer overflow notes', 'default.png', 'Low-level hacker', None, None, 1),
-            ('rachel_scan', 'rachel@scan.dev', 'r4ch3l_sc4n!', 'user',
-             '4485-9999-0000-1111', '08/27', '567', 1300.0,
-             'Nmap scan results archive', 'default.png', 'Scanner expert', None, None, 1),
-            ('sam_backdoor', 'sam@backdoor.org', 's4m_b4ckd00r', 'user',
-             '4485-2222-3333-4444', '12/26', '890', 1650.0,
-             'Persistence techniques', 'default.png', 'Red teamer', None, None, 1),
-        ]
-        c.executemany('''INSERT INTO users
-            (username, email, password, role,
-             credit_card_number, credit_card_expiry, credit_card_cvv, balance,
-             secret_note, profile_pic, bio, reset_token, reset_token_expiry, is_active)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''', users)
-
-    conn.commit()
-    conn.close()
-
-
-def init_shop_db():
-    """Initialize (or reset) the shop database."""
-    conn = get_shop_db()
-    c = conn.cursor()
-
-    c.execute('''CREATE TABLE IF NOT EXISTS books (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        title TEXT NOT NULL,
-        author TEXT NOT NULL,
-        price REAL NOT NULL,
-        image TEXT DEFAULT 'default_book.png',
-        description TEXT DEFAULT '',
-        category TEXT DEFAULT 'General',
-        stock INTEGER DEFAULT 100
-    )''')
-
-    c.execute('''CREATE TABLE IF NOT EXISTS cart (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL,
-        book_id INTEGER NOT NULL,
-        quantity INTEGER DEFAULT 1
-    )''')
-
-    c.execute('''CREATE TABLE IF NOT EXISTS orders (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL,
-        total REAL NOT NULL,
-        status TEXT DEFAULT 'pending',
-        shipping_address TEXT DEFAULT '',
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP
-    )''')
-
-    c.execute('''CREATE TABLE IF NOT EXISTS order_items (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        order_id INTEGER NOT NULL,
-        book_id INTEGER NOT NULL,
-        quantity INTEGER NOT NULL,
-        price REAL NOT NULL
-    )''')
-
-    c.execute('''CREATE TABLE IF NOT EXISTS reviews (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL,
-        book_id INTEGER NOT NULL,
-        rating INTEGER DEFAULT 5,
-        comment TEXT DEFAULT '',
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP
-    )''')
-
-    c.execute('''CREATE TABLE IF NOT EXISTS coupons (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        code TEXT UNIQUE NOT NULL,
-        discount_percent REAL NOT NULL,
-        is_active INTEGER DEFAULT 1,
-        max_uses INTEGER DEFAULT 1,
-        current_uses INTEGER DEFAULT 0
-    )''')
-
-    c.execute('''CREATE TABLE IF NOT EXISTS support_tickets (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL,
-        subject TEXT NOT NULL,
-        message TEXT NOT NULL,
-        status TEXT DEFAULT 'open',
-        admin_reply TEXT DEFAULT '',
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP
-    )''')
-
-    c.execute('''CREATE TABLE IF NOT EXISTS uploaded_files (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL,
-        filename TEXT NOT NULL,
-        original_filename TEXT NOT NULL,
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP
-    )''')
-
-    c.execute('''CREATE TABLE IF NOT EXISTS admin_logs (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        admin_id INTEGER NOT NULL,
-        action TEXT NOT NULL,
-        target_user_id INTEGER,
-        details TEXT DEFAULT '',
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP
-    )''')
-
-    # Seed books
-    c.execute('SELECT COUNT(*) as cnt FROM books')
-    if c.fetchone()['cnt'] == 0:
-        books = [
-            ('Basic Hacking Techniques', 'Khit Minnyo', 29.99, 'book1.jpg',
-             'A comprehensive guide to basic hacking techniques covering reconnaissance, scanning, and exploitation.', 'Hacking', 50),
-            ('Grade 3 Hacking', 'Khit Minnyo', 24.99, 'book2.jpg',
-             'Advanced hacking techniques for experienced practitioners. Covers advanced exploitation and post-exploitation.', 'Hacking', 30),
-            ('WiFi Hacking', 'Khit Minnyo', 19.99, 'book3.jpg',
-             'Learn the art of wireless network security. WPA2 cracking, evil twin attacks, and more.', 'Networking', 75),
-            ('The First Step Towards Hacking', 'Khit Minnyo', 22.99, 'book4.png',
-             'Begin your journey into ethical hacking. Perfect for absolute beginners.', 'Beginner', 100),
-            ('Linux For Hackers', 'Khit Minnyo', 21.99, 'book5.png',
-             'Master Linux for security testing. Command line, scripting, and system administration.', 'Linux', 60),
-            ('Networking For Hackers', 'Khit Minnyo', 23.99, 'book6.png',
-             'Network fundamentals for security professionals. TCP/IP, routing, firewalls, and IDS.', 'Networking', 45),
-            ('Web Application Security', 'Khit Minnyo', 27.99, 'book1.jpg',
-             'OWASP Top 10, SQL injection, XSS, CSRF, and modern web vulnerabilities.', 'Web Security', 80),
-            ('Reverse Engineering Mastery', 'Khit Minnyo', 34.99, 'book2.jpg',
-             'Binary analysis, disassembly, debugging, and malware reverse engineering.', 'Reverse Engineering', 25),
-            ('Python for Pentesters', 'Khit Minnyo', 26.99, 'book3.jpg',
-             'Automate penetration testing with Python. Scapy, Requests, and custom exploit development.', 'Programming', 90),
-            ('Social Engineering Tactics', 'Khit Minnyo', 18.99, 'book4.png',
-             'The art of human hacking. Phishing, pretexting, and physical social engineering.', 'Social Engineering', 55),
-        ]
-        c.executemany('''INSERT INTO books (title, author, price, image, description, category, stock)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)''', books)
-
-    # Seed coupons
-    c.execute('SELECT COUNT(*) as cnt FROM coupons')
-    if c.fetchone()['cnt'] == 0:
-        coupons = [
-            ('HACK10', 10.0, 1, 100, 0),
-            ('CYBER20', 20.0, 1, 50, 0),
-            ('ELITE50', 50.0, 1, 5, 0),
-            ('FREESHIP', 15.0, 1, 200, 0),
-            ('WELCOME25', 25.0, 1, 1000, 0),
-        ]
-        c.executemany('''INSERT INTO coupons (code, discount_percent, is_active, max_uses, current_uses)
-                        VALUES (?, ?, ?, ?, ?)''', coupons)
-
-    # Seed some reviews
-    c.execute('SELECT COUNT(*) as cnt FROM reviews')
-    if c.fetchone()['cnt'] == 0:
-        reviews = [
-            (2, 1, 5, 'Amazing book! Learned so much about hacking basics.', '2025-01-15 10:30:00'),
-            (3, 1, 4, 'Good content but could use more examples.', '2025-02-01 14:00:00'),
-            (4, 2, 5, 'Best advanced hacking book out there!', '2025-01-20 09:15:00'),
-            (5, 3, 3, 'Decent WiFi hacking guide, but a bit outdated.', '2025-03-10 16:45:00'),
-            (2, 4, 5, 'Perfect for beginners! Highly recommended.', '2025-02-14 11:00:00'),
-            (6, 5, 4, 'Great Linux reference for security work.', '2025-04-01 08:30:00'),
-        ]
-        c.executemany('''INSERT INTO reviews (user_id, book_id, rating, comment, created_at)
-                        VALUES (?, ?, ?, ?, ?)''', reviews)
-
-    conn.commit()
-    conn.close()
+    return database()
 
 
 def get_race_db():
-    """Connect to the isolated race-condition training database."""
-    conn = sqlite3.connect(RACE_DB, timeout=5)
-    conn.row_factory = sqlite3.Row
-    return conn
+    return database()
 
 
-def init_race_lab_db(reset=False):
-    """Create the isolated race lab without touching shop or user data."""
-    if reset and os.path.exists(RACE_DB):
-        os.remove(RACE_DB)
+def is_secure(_identifier):
+    return True
 
-    conn = get_race_db()
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS race_accounts (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT UNIQUE NOT NULL,
-        balance REAL NOT NULL DEFAULT 100.0
-    )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS race_transfers (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        sender TEXT NOT NULL,
-        recipient TEXT NOT NULL,
-        amount REAL NOT NULL,
-        mode TEXT NOT NULL,
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP
-    )''')
-
-    c.execute('SELECT COUNT(*) AS count FROM race_accounts')
-    if c.fetchone()['count'] == 0:
-        c.executemany(
-            'INSERT INTO race_accounts (username, balance) VALUES (?, ?)',
-            [('alice_hacker', 100.0), ('bob_secure', 0.0)],
-        )
-    conn.commit()
-    conn.close()
-
-
-# ============================================================
-# UTILITY FUNCTIONS
-# ============================================================
 
 def get_cart_count():
-    """Get cart item count for current user."""
-    if 'user_id' not in session:
+    if not getattr(g,'user',None):
         return 0
-    try:
-        conn = get_shop_db()
-        c = conn.cursor()
-        c.execute('SELECT SUM(quantity) as total FROM cart WHERE user_id = ?', (session['user_id'],))
-        row = c.fetchone()
-        conn.close()
-        return row['total'] or 0
-    except Exception:
-        return 0
+    return one('SELECT COALESCE(SUM(quantity),0) AS n FROM cart WHERE user_id=?',(g.user['id'],))['n']
 
-
-def login_required(f):
-    """Decorator — requires login."""
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        if 'user_id' not in session:
-            flash('Please login first.', 'danger')
-            return redirect(url_for('login'))
-        return f(*args, **kwargs)
-    return decorated
-
-
-def admin_required(f):
-    """Decorator — requires admin role (F4: only checks session, no server-side DB verification)."""
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        if 'user_id' not in session:
-            flash('Please login first.', 'danger')
-            return redirect(url_for('login'))
-        # F4 — Broken access control: only checks session role, not DB
-        if session.get('role') != 'admin':
-            flash('Admin access required.', 'danger')
-            return redirect(url_for('index'))
-        return f(*args, **kwargs)
-    return decorated
-
-
-def waf_check(input_str):
-    """Simplified WAF — intentionally bypassable."""
-    if not input_str:
-        return False
-
-    input_lower = input_str.lower()
-
-    # Allow MySQL-style comment bypass
-    if "/*!50000" in input_lower:
-        return False
-
-    blacklist = [
-        "union", "select", "from", "where",
-        "drop", "delete", "insert", "update", "alter",
-        "/*", "*/", "#", "--", "xp_", "sp_",
-        "sleep", "benchmark", "wait", "delay"
-    ]
-
-    for pattern in blacklist:
-        if pattern in input_lower:
-            return True
-
-    return False
-
-
-def log_admin_action(admin_id, action, target_user_id=None, details=''):
-    """Log admin actions."""
-    try:
-        conn = get_shop_db()
-        c = conn.cursor()
-        c.execute('''INSERT INTO admin_logs (admin_id, action, target_user_id, details)
-                     VALUES (?, ?, ?, ?)''', (admin_id, action, target_user_id, details))
-        conn.commit()
-        conn.close()
-    except Exception:
-        pass
-
-
-# ============================================================
-# CONTEXT PROCESSOR — inject cart_count into all templates
-# ============================================================
 
 @app.context_processor
 def inject_cart_count():
-    return dict(cart_count=get_cart_count(), is_secure=is_secure)
+    return dict(cart_count=get_cart_count(),is_secure=is_secure)
 
 
-# ============================================================
-# L5 — Missing security headers (applied globally)
-# ============================================================
-
-@app.after_request
-def add_headers(response):
-    # Intentionally NOT setting security headers
-    # No CSP, no X-Frame-Options, no X-Content-Type-Options
-    # L6 — Clickjacking: No X-Frame-Options
-    return response
+def log_admin_action(admin_id,action,target_user_id=None,details=''):
+    write('INSERT INTO admin_logs (admin_id,action,target_user_id,details) VALUES (?,?,?,?)',(admin_id,action,target_user_id,details))
 
 
-# ============================================================
-# AUTH ROUTES
-# ============================================================
+def owned_order(order_id):
+    order=one('SELECT * FROM orders WHERE id=?',(order_id,))
+    if not order or (order['user_id']!=g.user['id'] and g.user['role']!='admin'):
+        abort(404)
+    return order
 
-@app.route('/login', methods=['GET', 'POST'])
+
+def owned_review(review_id):
+    review=one('SELECT * FROM reviews WHERE id=?',(review_id,))
+    if not review or (review['user_id']!=g.user['id'] and g.user['role']!='admin'):
+        abort(404)
+    return review
+
+
+@app.cli.command('init-db')
+@click.password_option(confirmation_prompt=True)
+def init_db_command(password):
+    """Create a NEW fixed database with a user-supplied administrator password."""
+    initialize(app.config['DATABASE'],password,BOOKS,COUPONS)
+    click.echo('Initialized fixed database')
+
+
+@app.cli.command('migrate-data')
+@click.option('--users',required=True,type=click.Path(exists=True,dir_okay=False))
+@click.option('--shop',required=True,type=click.Path(exists=True,dir_okay=False))
+@click.option('--output',required=True,type=click.Path(dir_okay=False))
+def migrate_command(users,shop,output):
+    """Copy legacy data into a NEW fixed database; inputs remain unchanged."""
+    migrate(users,shop,output)
+    click.echo('Migration complete. Review the new database before selecting its data directory.')
+
+
+@app.cli.command('reset-link')
+@click.argument('username')
+def reset_link_command(username):
+    """Read a pending link locally, for handoff to its verified owner only."""
+    user=one('SELECT id FROM users WHERE username=?',(username,))
+    if not user:
+        raise click.ClickException('No pending reset')
+    path=Path(app.config['RESET_OUTBOX'])/str(user['id'])
+    if not path.is_file():
+        raise click.ClickException('No pending reset')
+    click.echo(path.read_text(encoding='utf-8'))
+
+
+@app.get('/api/csrf')
+def csrf_token_api():
+    return jsonify(csrf_token=generate_csrf())
+
+
+@app.errorhandler(HTTPException)
+def http_error(error):
+    message=error.description if error.code in (400,413,429,503) else error.name
+    if request.path.startswith('/api/'):
+        return jsonify(error=message),error.code
+    return render_template('error.html',error_code=error.code,error_message=message),error.code
+
+
+@app.errorhandler(CSRFError)
+def csrf_error(_error):
+    return jsonify(error='CSRF token missing, expired or invalid'),400
+
+
+@app.errorhandler(500)
+def server_error(_error):
+    return render_template('error.html',error_code=500,error_message='Internal server error'),500
+
+
+@app.route('/login',methods=['GET','POST'])
 def login():
-    attempt_info = None
-    if request.method == 'POST':
-        username = request.form.get('username', '')
-        password = request.form.get('password', '')
-
-        # E2 — Rate limiting. In secure mode a locked-out account is rejected
-        # before any DB lookup; in insecure mode we only count attempts.
-        locked = is_locked_out(username)
-        if locked > 0:
-            flash(f'Too many failed attempts. Account locked for {locked}s.', 'danger')
-            return render_template('login.html', attempt_info={
-                'count': LOGIN_ATTEMPTS.get(username, {}).get('count', 0),
-                'remaining': 0, 'locked': locked,
-                'secure': is_secure('E2_rate_limit'), 'max': RATE_LIMIT_MAX})
-
-        conn = get_user_db()
-        c = conn.cursor()
-
-        try:
-            # Try safe login first
-            c.execute('SELECT * FROM users WHERE username = ? AND password = ?', (username, password))
-            user = c.fetchone()
-
-            if user:
-                record_login_attempt(username, success=True)
-                # E3 — Session fixation: not regenerating session
-                session['user_id'] = user['id']
-                session['username'] = user['username']
-                session['role'] = user['role']
-                flash('Login successful!', 'success')
-
-                # L1 — Open redirect
-                next_url = request.form.get('next', '') or request.args.get('next', '')
-                if next_url:
-                    return redirect(next_url)
-                return redirect(url_for('index'))
-
-            # A5 — SQL injection in login. Toggleable: in secure mode the
-            # vulnerable string-formatted query path is skipped entirely.
-            if not is_secure('A5_sqli_login') and not waf_check(username) and not waf_check(password):
-                query = f"SELECT * FROM users WHERE username = '{username}' AND password = '{password}'"
-                try:
-                    c.execute(query)
-                    user = c.fetchone()
-                    if user:
-                        record_login_attempt(username, success=True)
-                        session['user_id'] = user['id']
-                        session['username'] = user['username']
-                        session['role'] = user['role']
-                        flash('Login successful!', 'success')
-                        return redirect(url_for('index'))
-                except sqlite3.Error:
-                    pass
-            elif not is_secure('A5_sqli_login'):
-                flash('WAF Detection: Potential SQL injection detected!', 'danger')
-
-            # Failed login — record the attempt for rate-limit tracking.
-            stats = record_login_attempt(username, success=False)
-            attempt_info = {
-                'count': stats['count'], 'remaining': stats['remaining'],
-                'locked': is_locked_out(username),
-                'secure': is_secure('E2_rate_limit'), 'max': RATE_LIMIT_MAX}
-
-            # E5 — Username enumeration: different error messages
-            c.execute('SELECT * FROM users WHERE username = ?', (username,))
-            if c.fetchone():
-                flash('Incorrect password.', 'danger')
-            else:
-                flash('User not found.', 'danger')
-
-        except Exception as e:
-            flash(f'Login error occurred.', 'danger')
-        finally:
-            conn.close()
-
-    return render_template('login.html', attempt_info=attempt_info)
+    if request.method=='POST':
+        user=authenticate(request.form.get('username',''),request.form.get('password',''))
+        if user:
+            start_session(user)
+            return redirect(safe_redirect(request.form.get('next') or request.args.get('next','/')))
+        flash('Invalid username or password.','danger')
+    return render_template('login.html',attempt_info=None)
 
 
-@app.route('/logout')
+@app.post('/logout')
+@login_required
 def logout():
-    # L5 — Logout via GET (CSRF logout attack possible)
-    session.clear()
-    flash('You have been logged out.', 'success')
+    end_session()
     return redirect(url_for('index'))
 
 
-@app.route('/register', methods=['GET', 'POST'])
+@app.route('/register',methods=['GET','POST'])
 def register():
-    if request.method == 'POST':
-        username = request.form.get('username', '')
-        email = request.form.get('email', '')
-        password = request.form.get('password', '')
-        credit_card_number = request.form.get('credit_card_number', '')
-        credit_card_expiry = request.form.get('credit_card_expiry', '')
-        credit_card_cvv = request.form.get('credit_card_cvv', '')
-
-        conn = get_user_db()
-        c = conn.cursor()
-
-        c.execute('SELECT * FROM users WHERE username = ? OR email = ?', (username, email))
-        if c.fetchone():
-            flash('Username or email already exists!', 'danger')
-            conn.close()
-            return render_template('register.html')
-
+    if request.method=='POST':
+        username=text(request.form.get('username',''),32)
+        if not re.fullmatch(r'[A-Za-z0-9_]{3,32}',username):
+            abort(400,description='Username must contain 3 to 32 letters, digits or underscores')
+        address=email(request.form.get('email',''))
+        password=valid_password(request.form.get('password',''))
+        if password!=request.form.get('confirm_password'):
+            abort(400,description='Passwords do not match')
+        expiry=text(request.form.get('credit_card_expiry',''),5,required=False)
+        if expiry and not re.fullmatch(r'(0[1-9]|1[0-2])/[0-9]{2}',expiry):
+            abort(400,description='Invalid expiry')
         try:
-            # F2 — Plaintext password storage
-            c.execute('''INSERT INTO users (username, email, password,
-                        credit_card_number, credit_card_expiry, credit_card_cvv,
-                        balance, secret_note, bio)
-                        VALUES (?, ?, ?, ?, ?, ?, 1000.0, 'Welcome to the bookshop!', '')''',
-                     (username, email, password,
-                      credit_card_number, credit_card_expiry, credit_card_cvv))
-            conn.commit()
-
-            c.execute('SELECT * FROM users WHERE username = ?', (username,))
-            user = c.fetchone()
-
-            session['user_id'] = user['id']
-            session['username'] = user['username']
-            session['role'] = user['role']
-
-            flash("Registration successful! Welcome to Khit's Bookshop!", 'success')
-            return redirect(url_for('index'))
-        except Exception as e:
-            flash('An error occurred during registration.', 'danger')
-        finally:
-            conn.close()
-
+            write('INSERT INTO users (username,email,password,credit_card_number,credit_card_expiry) VALUES (?,?,?,?,?)',(username,address,generate_password_hash(password),mask_card(request.form.get('credit_card_number','')),expiry))
+        except sqlite3.IntegrityError:
+            flash('Registration could not be completed with those details.','danger')
+            return render_template('register.html'),400
+        start_session(one('SELECT * FROM users WHERE username=?',(username,)))
+        return redirect(url_for('index'))
     return render_template('register.html')
 
 
-@app.route('/forgot_password', methods=['GET', 'POST'])
+@app.route('/forgot_password',methods=['GET','POST'])
 def forgot_password():
-    if request.method == 'POST':
-        username = request.form.get('username', '')
-
-        conn = get_user_db()
-        c = conn.cursor()
-        c.execute('SELECT * FROM users WHERE username = ?', (username,))
-        user = c.fetchone()
-
-        if user:
-            # E1 — Predictable reset token: MD5(username + static_secret)
-            token = hashlib.md5(f"{username}{STATIC_RESET_SECRET}".encode()).hexdigest()
-            expiry = (datetime.now() + timedelta(hours=1)).strftime('%Y-%m-%d %H:%M:%S')
-
-            c.execute('UPDATE users SET reset_token = ?, reset_token_expiry = ? WHERE id = ?',
-                     (token, expiry, user['id']))
-            conn.commit()
-
-            # E2 — No rate limiting on password reset
-            flash(f'Password reset link: /reset_password/{token}', 'info')
-        else:
-            # E5 — Username enumeration
-            flash('User not found.', 'danger')
-
-        conn.close()
-
+    if request.method=='POST':
+        limit_action('reset',3)
+        username=text(request.form.get('username',''),64)
+        now=int(time.time())
+        user=one('SELECT * FROM users WHERE username=? AND is_active=1',(username,))
+        # Only one live reset per account every fifteen minutes, with a generic response.
+        if user and (not user['reset_token_expiry'] or int(user['reset_token_expiry'])<now):
+            token=secrets.token_urlsafe(32)
+            write('UPDATE users SET reset_token=?,reset_token_expiry=? WHERE id=?',(digest(token),now+900,user['id']))
+            outbox=Path(app.config['RESET_OUTBOX']); outbox.mkdir(parents=True,exist_ok=True,mode=0o700)
+            path=outbox/str(user['id'])
+            descriptor=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o600)
+            with os.fdopen(descriptor,'w',encoding='utf-8') as delivery:
+                delivery.write('/reset_password/'+token)
+        flash('If the account is eligible, a reset request has been recorded. Contact the local operator.','info')
     return render_template('forgot_password.html')
 
 
-@app.route('/reset_password/<token>', methods=['GET', 'POST'])
+@app.route('/reset_password/<token>',methods=['GET','POST'])
 def reset_password(token):
-    conn = get_user_db()
-    c = conn.cursor()
-
-    c.execute('SELECT * FROM users WHERE reset_token = ?', (token,))
-    user = c.fetchone()
-
+    now=int(time.time()); hashed=digest(token)
+    user=one('SELECT id FROM users WHERE reset_token=? AND reset_token_expiry>? AND is_active=1',(hashed,now))
     if not user:
-        flash('Invalid or expired reset token.', 'danger')
-        conn.close()
+        abort(400,description='Invalid or expired reset link')
+    if request.method=='POST':
+        password=valid_password(request.form.get('password',''))
+        if password!=request.form.get('confirm_password'):
+            abort(400,description='Passwords do not match')
+        with transaction(app.config['DATABASE']) as db:
+            changed=db.execute('UPDATE users SET password=?,reset_token=NULL,reset_token_expiry=NULL,auth_version=auth_version+1 WHERE reset_token=? AND reset_token_expiry>? AND is_active=1',(generate_password_hash(password),hashed,now)).rowcount
+            if changed!=1:
+                abort(400)
+            db.execute('DELETE FROM sessions WHERE user_id=?',(user['id'],))
+        (Path(app.config['RESET_OUTBOX'])/str(user['id'])).unlink(missing_ok=True)
+        end_session()
         return redirect(url_for('login'))
+    return render_template('reset_password.html',token=token)
 
-    if request.method == 'POST':
-        new_password = request.form.get('password', '')
-        # No old password required, no password strength check
-        c.execute('UPDATE users SET password = ?, reset_token = NULL, reset_token_expiry = NULL WHERE id = ?',
-                 (new_password, user['id']))
-        conn.commit()
-        flash('Password reset successful!', 'success')
-        conn.close()
-        return redirect(url_for('login'))
-
-    conn.close()
-    return render_template('reset_password.html', token=token)
-
-
-# ============================================================
-# MAIN ROUTES (Index, Books, Book Details)
-# ============================================================
 
 @app.route('/')
 def index():
@@ -842,7 +225,7 @@ def books():
     c = conn.cursor()
 
     if search:
-        # A7 — SQL injection in search. Toggleable: secure mode uses a
+        # A7 вЂ” SQL injection in search. Toggleable: secure mode uses a
         # parameterized query so injection is no longer possible.
         if is_secure('A7_sqli_search'):
             c.execute("SELECT * FROM books WHERE title LIKE ? OR author LIKE ?",
@@ -864,7 +247,7 @@ def books():
         book_list = c.fetchall()
 
     conn.close()
-    # B1 — Reflected XSS: search value passed to template (rendered with |safe in template)
+    # B1 вЂ” Reflected XSS: search value passed to template (rendered with |safe in template)
     return render_template('books.html', books=book_list, search=search)
 
 
@@ -880,21 +263,21 @@ def book_details():
     c = conn.cursor()
 
     try:
-        # WAF check — bypassable
+        # WAF check вЂ” bypassable
         if waf_check(book_id):
             return "WAF blocked suspicious input", 403
 
         # Strip MySQL-style comments for SQLite compatibility
         cleaned_id = book_id.replace("/*!50000", "").replace("*/", "")
 
-        # A1/A2 — Error-based & UNION-based SQL injection
+        # A1/A2 вЂ” Error-based & UNION-based SQL injection
         query = f"SELECT id, title, author, price, image, description, category, stock FROM books WHERE id = {cleaned_id}"
 
         try:
             c.execute(query)
             book = c.fetchone()
         except sqlite3.OperationalError as sql_err:
-            # J3 — Verbose error messages
+            # J3 вЂ” Verbose error messages
             conn.close()
             return f"SQL Error: {str(sql_err)}", 500
 
@@ -936,122 +319,62 @@ def book_details():
             pass
 
 
-# ============================================================
-# PROFILE ROUTES
-# ============================================================
-
-@app.route('/profile')
+@app.get('/profile')
 @login_required
 def profile():
-    # D1 — IDOR: user_id parameter allows viewing other users' profiles.
-    # Toggleable: secure mode ignores the parameter and only shows the
-    # logged-in user's own profile.
-    if is_secure('D1_idor_profile'):
-        user_id = session['user_id']
-    else:
-        user_id = request.args.get('user_id', session['user_id'])
-
-    conn = get_user_db()
-    c = conn.cursor()
-    c.execute('SELECT * FROM users WHERE id = ?', (user_id,))
-    user = c.fetchone()
-    conn.close()
-
-    if not user:
-        flash('User not found.', 'danger')
-        return redirect(url_for('index'))
-
-    # Get user's orders
-    sconn = get_shop_db()
-    sc = sconn.cursor()
-    sc.execute('SELECT * FROM orders WHERE user_id = ? ORDER BY created_at DESC LIMIT 5', (user_id,))
-    orders = sc.fetchall()
-    sconn.close()
-
-    return render_template('profile.html', user=user, orders=orders)
+    if request.args.get('user_id') and positive_int(request.args['user_id'],2**31-1)!=g.user['id']:
+        abort(403)
+    orders=rows('SELECT * FROM orders WHERE user_id=? ORDER BY created_at DESC LIMIT 5',(g.user['id'],))
+    return render_template('profile.html',user=g.user,orders=orders)
 
 
-@app.route('/edit_profile', methods=['GET', 'POST'])
+@app.route('/edit_profile',methods=['GET','POST'])
 @login_required
 def edit_profile():
-    conn = get_user_db()
-    c = conn.cursor()
-
-    if request.method == 'POST':
-        bio = request.form.get('bio', '')
-        email = request.form.get('email', '')
-
-        # B4 — Stored XSS: bio stored without sanitization, rendered with |safe
-        c.execute('UPDATE users SET bio = ?, email = ? WHERE id = ?',
-                 (bio, email, session['user_id']))
-        conn.commit()
-        flash('Profile updated successfully!', 'success')
-        conn.close()
+    if request.method=='POST':
+        address=email(request.form.get('email',''))
+        if address!=g.user['email']:
+            current_password()
+        bio=text(request.form.get('bio',''),2000,required=False)
+        try:
+            write('UPDATE users SET bio=?,email=? WHERE id=?',(bio,address,g.user['id']))
+        except sqlite3.IntegrityError:
+            abort(400,description='Profile could not be updated')
         return redirect(url_for('profile'))
-
-    c.execute('SELECT * FROM users WHERE id = ?', (session['user_id'],))
-    user = c.fetchone()
-    conn.close()
-    return render_template('edit_profile.html', user=user)
+    return render_template('edit_profile.html',user=g.user)
 
 
-@app.route('/change_password', methods=['POST'])
+@app.post('/change_password')
 @login_required
 def change_password():
-    # C1 — CSRF: No CSRF token validation
-    # E4 — Account takeover: no current-password confirmation is required.
-    # Any authenticated request against this route (a stolen session
-    # cookie, an XSS payload riding the victim's session, or the CSRF
-    # above) fully takes over the account without ever knowing the
-    # existing password.
-    new_password = request.form.get('new_password', '')
-
-    if not new_password:
-        flash('Password cannot be empty.', 'danger')
-        return redirect(url_for('edit_profile'))
-
-    conn = get_user_db()
-    c = conn.cursor()
-    c.execute('UPDATE users SET password = ? WHERE id = ?', (new_password, session['user_id']))
-    conn.commit()
-    conn.close()
-
-    flash('Password changed successfully!', 'success')
-    return redirect(url_for('profile'))
+    current_password()
+    password=valid_password(request.form.get('new_password',''))
+    with transaction(app.config['DATABASE']) as db:
+        db.execute('UPDATE users SET password=?,auth_version=auth_version+1 WHERE id=?',(generate_password_hash(password),g.user['id']))
+        db.execute('DELETE FROM sessions WHERE user_id=?',(g.user['id'],))
+    end_session()
+    return redirect(url_for('login'))
 
 
-@app.route('/change_email', methods=['POST'])
+@app.post('/change_email')
 @login_required
 def change_email():
-    # C2 — CSRF: No CSRF token validation
-    new_email = request.form.get('new_email', '')
-
-    if not new_email:
-        flash('Email cannot be empty.', 'danger')
-        return redirect(url_for('edit_profile'))
-
-    conn = get_user_db()
-    c = conn.cursor()
-    c.execute('UPDATE users SET email = ? WHERE id = ?', (new_email, session['user_id']))
-    conn.commit()
-    conn.close()
-
-    flash('Email changed successfully!', 'success')
+    current_password()
+    try:
+        write('UPDATE users SET email=? WHERE id=?',(email(request.form.get('new_email','')),g.user['id']))
+    except sqlite3.IntegrityError:
+        abort(400,description='Email could not be updated')
     return redirect(url_for('profile'))
 
 
-@app.route('/delete_account', methods=['POST'])
+@app.post('/delete_account')
 @login_required
 def delete_account():
-    # C5 — CSRF: No CSRF token validation
-    conn = get_user_db()
-    c = conn.cursor()
-    c.execute('UPDATE users SET is_active = 0 WHERE id = ?', (session['user_id'],))
-    conn.commit()
-    conn.close()
-
-    session.clear()
-    flash('Account deleted.', 'info')
+    current_password()
+    with transaction(app.config['DATABASE']) as db:
+        db.execute('UPDATE users SET is_active=0,auth_version=auth_version+1 WHERE id=?',(g.user['id'],))
+        db.execute('DELETE FROM sessions WHERE user_id=?',(g.user['id'],))
+    end_session()
     return redirect(url_for('index'))
 
 
@@ -1067,14 +390,14 @@ def upload_avatar():
         flash('No file selected.', 'danger')
         return redirect(url_for('edit_profile'))
 
-    # G1 — Unrestricted file upload: no extension/type validation
-    # G2 — Path traversal: filename used directly
-    # G3 — No MIME type validation
+    # G1 вЂ” Unrestricted file upload: no extension/type validation
+    # G2 вЂ” Path traversal: filename used directly
+    # G3 вЂ” No MIME type validation
     filename = file.filename  # No secure_filename!
     filepath = os.path.join(UPLOAD_FOLDER, filename)
     file.save(filepath)
 
-    # B5 — XSS via filename: original filename stored and rendered
+    # B5 вЂ” XSS via filename: original filename stored and rendered
     conn = get_user_db()
     c = conn.cursor()
     c.execute('UPDATE users SET profile_pic = ? WHERE id = ?', (filename, session['user_id']))
@@ -1093,15 +416,11 @@ def upload_avatar():
     return redirect(url_for('profile'))
 
 
-# ============================================================
-# SHOPPING ROUTES (Cart, Checkout, Orders)
-# ============================================================
-
 @app.route('/add_to_cart/<int:book_id>', methods=['POST'])
 @login_required
 def add_to_cart(book_id):
-    # C3 — CSRF: No token validation
-    # K1 — Negative quantity: accepts any quantity value
+    # C3 вЂ” CSRF: No token validation
+    # K1 вЂ” Negative quantity: accepts any quantity value
     quantity = request.form.get('quantity', 1, type=int)
 
     conn = get_shop_db()
@@ -1180,7 +499,7 @@ def checkout():
 
     if request.method == 'POST':
         shipping_address = request.form.get('shipping_address', '')
-        # K3 — Price manipulation: uses client-submitted total instead of server-calculated
+        # K3 вЂ” Price manipulation: uses client-submitted total instead of server-calculated
         submitted_total = request.form.get('total', total, type=float)
 
         uconn = get_user_db()
@@ -1188,7 +507,7 @@ def checkout():
         uc.execute('SELECT balance FROM users WHERE id = ?', (session['user_id'],))
         user = uc.fetchone()
 
-        # K5 — Insufficient balance bypass: uses submitted_total
+        # K5 вЂ” Insufficient balance bypass: uses submitted_total
         if user['balance'] < submitted_total:
             uconn.close()
             conn.close()
@@ -1244,7 +563,7 @@ def apply_coupon():
     coupon = c.fetchone()
 
     if coupon:
-        # K4 — Coupon reuse: max_uses not properly enforced
+        # K4 вЂ” Coupon reuse: max_uses not properly enforced
         session['coupon_discount'] = coupon['discount_percent']
         session['coupon_code'] = code
         flash(f'Coupon applied! {coupon["discount_percent"]}% discount.', 'success')
@@ -1273,7 +592,7 @@ def order_detail(order_id):
     conn = get_shop_db()
     c = conn.cursor()
 
-    # D2 — IDOR: No check if order belongs to current user
+    # D2 вЂ” IDOR: No check if order belongs to current user
     c.execute('SELECT * FROM orders WHERE id = ?', (order_id,))
     order = c.fetchone()
 
@@ -1295,7 +614,7 @@ def order_detail(order_id):
 @app.route('/download_receipt/<int:order_id>')
 @login_required
 def download_receipt(order_id):
-    # D3 — IDOR: No ownership check
+    # D3 вЂ” IDOR: No ownership check
     conn = get_shop_db()
     c = conn.cursor()
     c.execute('SELECT * FROM orders WHERE id = ?', (order_id,))
@@ -1313,7 +632,7 @@ def download_receipt(order_id):
     conn.close()
 
     # Generate text receipt
-    receipt = f"=== RECEIPT — Order #{order_id} ===\n"
+    receipt = f"=== RECEIPT вЂ” Order #{order_id} ===\n"
     receipt += f"Date: {order['created_at']}\n"
     receipt += f"Status: {order['status']}\n"
     receipt += f"Shipping: {order['shipping_address']}\n\n"
@@ -1328,17 +647,13 @@ def download_receipt(order_id):
     return response
 
 
-# ============================================================
-# REVIEW ROUTES
-# ============================================================
-
 @app.route('/review/<int:book_id>', methods=['POST'])
 @login_required
 def add_review(book_id):
     rating = request.form.get('rating', 5, type=int)
     comment = request.form.get('comment', '')
 
-    # B2 — Stored XSS: comment stored without sanitization
+    # B2 вЂ” Stored XSS: comment stored without sanitization
     conn = get_shop_db()
     c = conn.cursor()
     c.execute('''INSERT INTO reviews (user_id, book_id, rating, comment)
@@ -1354,7 +669,7 @@ def add_review(book_id):
 @app.route('/edit_review/<int:review_id>', methods=['POST'])
 @login_required
 def edit_review(review_id):
-    # D4 — IDOR: No ownership check on review
+    # D4 вЂ” IDOR: No ownership check on review
     comment = request.form.get('comment', '')
     rating = request.form.get('rating', 5, type=int)
 
@@ -1377,7 +692,7 @@ def edit_review(review_id):
 @app.route('/delete_review/<int:review_id>', methods=['POST'])
 @login_required
 def delete_review(review_id):
-    # D4 — IDOR: No ownership check
+    # D4 вЂ” IDOR: No ownership check
     conn = get_shop_db()
     c = conn.cursor()
     c.execute('SELECT book_id FROM reviews WHERE id = ?', (review_id,))
@@ -1392,15 +707,11 @@ def delete_review(review_id):
     return redirect(url_for('books'))
 
 
-# ============================================================
-# BALANCE TRANSFER
-# ============================================================
-
 @app.route('/transfer', methods=['GET', 'POST'])
 @login_required
 def transfer_balance():
     if request.method == 'POST':
-        # C4 — CSRF: No token validation for money transfer
+        # C4 вЂ” CSRF: No token validation for money transfer
         recipient_username = request.form.get('recipient', '')
         amount = request.form.get('amount', 0, type=float)
 
@@ -1434,7 +745,7 @@ def transfer_balance():
             conn.close()
             return redirect(url_for('transfer_balance'))
 
-        # K2 — Race condition: no locking, vulnerable to double-spend
+        # K2 вЂ” Race condition: no locking, vulnerable to double-spend
         c.execute('UPDATE users SET balance = balance - ? WHERE id = ?',
                  (amount, session['user_id']))
         c.execute('UPDATE users SET balance = balance + ? WHERE id = ?',
@@ -1445,7 +756,7 @@ def transfer_balance():
         flash(f'${amount:.2f} transferred to {recipient_username}!', 'success')
         return redirect(url_for('profile'))
 
-    # GET — show transfer form
+    # GET вЂ” show transfer form
     conn = get_user_db()
     c = conn.cursor()
     c.execute('SELECT * FROM users WHERE id = ?', (session['user_id'],))
@@ -1454,10 +765,6 @@ def transfer_balance():
 
     return render_template('transfer.html', user=user)
 
-
-# ============================================================
-# SUPPORT TICKET ROUTES
-# ============================================================
 
 @app.route('/support')
 @login_required
@@ -1492,13 +799,9 @@ def new_ticket():
     return render_template('new_ticket.html')
 
 
-# ============================================================
-# API ROUTES (various vulnerabilities)
-# ============================================================
-
 @app.route('/api/check_username')
 def api_check_username():
-    """A3 — Blind Boolean SQL injection."""
+    """A3 вЂ” Blind Boolean SQL injection."""
     username = request.args.get('username', '')
 
     conn = get_user_db()
@@ -1522,7 +825,7 @@ def api_check_username():
 
 @app.route('/api/check_coupon')
 def api_check_coupon():
-    """A4 — Time-based Blind SQL injection."""
+    """A4 вЂ” Time-based Blind SQL injection."""
     code = request.args.get('code', '')
 
     conn = get_shop_db()
@@ -1545,46 +848,30 @@ def api_check_coupon():
         return jsonify({'error': str(e)}), 500
 
 
-@app.route('/api/user/<int:user_id>/card')
+@app.get('/api/user/<int:user_id>/card')
+@login_required
 def api_user_card(user_id):
-    """D5 — IDOR: API endpoint exposing credit card info without auth check."""
-    conn = get_user_db()
-    c = conn.cursor()
-    c.execute('SELECT username, credit_card_number, credit_card_expiry FROM users WHERE id = ?',
-              (user_id,))
-    user = c.fetchone()
-    conn.close()
-
-    if user:
-        return jsonify({
-            'username': user['username'],
-            'card_number': user['credit_card_number'],
-            'card_expiry': user['credit_card_expiry']
-        })
-    return jsonify({'error': 'User not found'}), 404
+    if user_id!=g.user['id']:
+        abort(403)
+    return jsonify(username=g.user['username'],card_number=g.user['credit_card_number'],card_expiry=g.user['credit_card_expiry'])
 
 
-@app.route('/api/update_role', methods=['POST'])
+@app.post('/api/update_role')
+@admin_required
 def api_update_role():
-    """F5 — Privilege escalation: hidden endpoint to change user role."""
-    user_id = request.form.get('user_id', '')
-    new_role = request.form.get('role', 'user')
-
-    if not user_id:
-        return jsonify({'error': 'user_id required'}), 400
-
-    conn = get_user_db()
-    c = conn.cursor()
-    c.execute('UPDATE users SET role = ? WHERE id = ?', (new_role, user_id))
-    conn.commit()
-    conn.close()
-
-    return jsonify({'success': True, 'message': f'Role updated to {new_role}'})
+    user_id=positive_int(request.form.get('user_id'),2**31-1)
+    role=request.form.get('role','')
+    if role not in {'user','moderator','admin'} or user_id==g.user['id']:
+        abort(400)
+    if write('UPDATE users SET role=?,auth_version=auth_version+1 WHERE id=?',(role,user_id))!=1:
+        abort(404)
+    log_admin_action(g.user['id'],'change_role',user_id)
+    return jsonify(success=True)
 
 
 @app.route('/api/import_books', methods=['POST'])
 def api_import_books():
-    """L3 — XXE: XML External Entity injection via book import."""
+    """L3 вЂ” XXE: XML External Entity injection via book import."""
     if 'xml_file' not in request.files:
         xml_data = request.data
     else:
@@ -1594,7 +881,7 @@ def api_import_books():
         return jsonify({'error': 'No XML data provided'}), 400
 
     try:
-        # L3 — XXE vulnerable: parsing XML without disabling external
+        # L3 вЂ” XXE vulnerable: parsing XML without disabling external
         # entities. NOTE: stdlib xml.etree.ElementTree (expat) does NOT
         # resolve external SYSTEM/PUBLIC entities, so this route was not
         # actually exploitable for classic XXE (file read / SSRF) on any
@@ -1630,24 +917,20 @@ def api_import_books():
 
 @app.route('/api/load_cart', methods=['POST'])
 def api_load_cart():
-    """L4 — Insecure deserialization: pickle-based cart restore."""
+    """L4 вЂ” Insecure deserialization: pickle-based cart restore."""
     cart_data = request.form.get('cart_data', '')
 
     if not cart_data:
         return jsonify({'error': 'No cart data provided'}), 400
 
     try:
-        # Insecure deserialization — pickle.loads on user input
+        # Insecure deserialization вЂ” pickle.loads on user input
         decoded = base64.b64decode(cart_data)
         cart = pickle.loads(decoded)
         return jsonify({'success': True, 'cart': str(cart)})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-
-# ============================================================
-# ADMIN ROUTES
-# ============================================================
 
 @app.route('/admin')
 @admin_required
@@ -1692,7 +975,7 @@ def admin_dashboard():
 @app.route('/admin/users')
 @admin_required
 def admin_users():
-    """F6 — Forced browsing: URL directly accessible if role check bypassed."""
+    """F6 вЂ” Forced browsing: URL directly accessible if role check bypassed."""
     conn = get_user_db()
     c = conn.cursor()
     c.execute('SELECT * FROM users ORDER BY id')
@@ -1757,7 +1040,7 @@ def admin_reply_ticket(ticket_id):
     reply = request.form.get('reply', '')
     conn = get_shop_db()
     c = conn.cursor()
-    # A6 — Second-order SQLi potential: admin_reply stored, could be reflected elsewhere
+    # A6 вЂ” Second-order SQLi potential: admin_reply stored, could be reflected elsewhere
     c.execute("UPDATE support_tickets SET admin_reply = ?, status = 'closed' WHERE id = ?",
               (reply, ticket_id))
     conn.commit()
@@ -1775,7 +1058,7 @@ def admin_ping():
     if request.method == 'POST':
         host = request.form.get('host', '')
 
-        # H1 — OS Command Injection
+        # H1 вЂ” OS Command Injection
         try:
             output = subprocess.check_output(
                 f"ping -c 2 {host}",
@@ -1803,7 +1086,7 @@ def admin_preview_url():
     if request.method == 'POST':
         url = request.form.get('url', '')
 
-        # I1 — SSRF: No URL validation, fetches arbitrary URLs
+        # I1 вЂ” SSRF: No URL validation, fetches arbitrary URLs
         try:
             response = urlopen(url, timeout=5)
             content = response.read().decode('utf-8', errors='replace')[:5000]
@@ -1820,7 +1103,7 @@ def admin_preview_url():
 def admin_export():
     fmt = request.args.get('format', 'csv')
 
-    # H2 — Command injection in export
+    # H2 вЂ” Command injection in export
     try:
         conn = get_shop_db()
         c = conn.cursor()
@@ -1846,48 +1129,22 @@ def admin_export():
         return f"Export error: {str(e)}", 500
 
 
-@app.route('/admin/reset_data', methods=['POST'])
+@app.post('/admin/reset_data')
 @admin_required
 def admin_reset_data():
-    """Reset shop data (bookshop.db) while preserving users (users.db)."""
-    try:
-        conn = get_shop_db()
-        c = conn.cursor()
+    abort(405)
 
-        # Drop all shop tables
-        tables = ['books', 'cart', 'orders', 'order_items', 'reviews',
-                   'coupons', 'support_tickets', 'uploaded_files', 'admin_logs']
-        for table in tables:
-            c.execute(f'DROP TABLE IF EXISTS {table}')
-
-        conn.commit()
-        conn.close()
-
-        # Reinitialize
-        init_shop_db()
-
-        log_admin_action(session['user_id'], 'reset_data', details='Full shop data reset')
-        flash('Shop data has been reset. User accounts are preserved.', 'success')
-    except Exception as e:
-        flash(f'Reset error: {str(e)}', 'danger')
-
-    return redirect(url_for('admin_dashboard'))
-
-
-# ============================================================
-# MISCELLANEOUS VULNERABILITY ROUTES
-# ============================================================
 
 @app.route('/redirect')
 def open_redirect():
-    """L1 — Open redirect: no URL validation."""
+    """L1 вЂ” Open redirect: no URL validation."""
     url = request.args.get('url', '/')
     return redirect(url)
 
 
 @app.route('/set_language')
 def set_language():
-    """L2 — HTTP header injection."""
+    """L2 вЂ” HTTP header injection."""
     lang = request.args.get('lang', 'en')
     response = make_response(redirect(url_for('index')))
     # Header injection: lang value injected into Set-Cookie header
@@ -1895,45 +1152,21 @@ def set_language():
     return response
 
 
-@app.route('/debug_db')
+@app.get('/debug_db')
 def debug_db():
-    """J2 — Debug endpoint exposing sensitive data."""
-    try:
-        conn = get_user_db()
-        c = conn.cursor()
-        c.execute('SELECT username, email, password, secret_note, credit_card_number FROM users')
-        users = c.fetchall()
-        conn.close()
-
-        output = "<h2>Debug Database Dump</h2><pre>"
-        for u in users:
-            output += f"User: {u['username']} | Email: {u['email']} | Pass: {u['password']} | Card: {u['credit_card_number']} | Note: {u['secret_note']}\n"
-        output += "</pre>"
-
-        return output
-    except Exception as e:
-        return f"Debug error: {str(e)}", 500
+    abort(404)
 
 
-@app.route('/robots.txt')
+@app.get('/robots.txt')
 def robots():
-    """J4 — Information leakage via robots.txt."""
-    content = """User-agent: *
-Disallow: /admin
-Disallow: /debug_db
-Disallow: /api/
-Disallow: /static/uploads/
-Disallow: /admin/ping
-Disallow: /admin/preview_url
-Disallow: /.git/
-"""
-    return Response(content, mimetype='text/plain')
+    response=make_response('User-agent: *\nDisallow: /admin\n')
+    response.mimetype='text/plain'
+    return response
 
 
-# J6 — Directory listing for uploads
 @app.route('/uploads')
 def list_uploads():
-    """J6 — Directory listing of uploaded files."""
+    """J6 вЂ” Directory listing of uploaded files."""
     try:
         files = os.listdir(UPLOAD_FOLDER)
         output = "<h2>Uploaded Files</h2><ul>"
@@ -1945,25 +1178,14 @@ def list_uploads():
         return f"Error: {str(e)}", 500
 
 
-# J7 — Backup file exposure
-@app.route('/app.py.bak')
+@app.get('/app.py.bak')
 def backup_file():
-    """J7 — Backup file exposure."""
-    return send_file(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'app.py'),
-                     mimetype='text/plain')
+    abort(404)
 
-
-# B3 — DOM-based XSS: served via a specific page route
-# (The actual vulnerability is in the JavaScript in base.html)
-
-
-# ============================================================
-# TEMPLATE CONTEXT — DOM XSS payload
-# ============================================================
 
 @app.route('/search')
 def search_page():
-    """B1 — Reflected XSS via search page."""
+    """B1 вЂ” Reflected XSS via search page."""
     q = request.args.get('q', '')
     conn = get_shop_db()
     c = conn.cursor()
@@ -1977,219 +1199,47 @@ def search_page():
     results = c.fetchall()
     conn.close()
 
-    # B1 — search query passed to template, rendered with |safe
+    # B1 вЂ” search query passed to template, rendered with |safe
     return render_template('search.html', query=q, results=results)
 
 
-# ============================================================
-# LAB CONTROL PANEL — Difficulty Toggle UI
-# ============================================================
-
-def full_lab_reset():
-    """Restore the lab to a pristine state.
-
-    Regenerates all lab databases from the embedded seed data, wipes every
-    uploaded file (keeping only default.png), and resets all difficulty
-    toggles to INSECURE. Robust against SQLi damage (e.g. DROP TABLE) and
-    modified users.db, because the DB files are deleted and recreated.
-
-    Returns a short summary dict for reporting.
-    """
-    summary = {'databases': [], 'uploads_removed': 0, 'config': 'reset'}
-
-    # 1. Delete the database files so init_* fully re-seeds them.
-    for path, name in (
-        (USER_DB, 'users.db'),
-        (SHOP_DB, 'bookshop.db'),
-        (RACE_DB, 'race_lab.db'),
-    ):
-        try:
-            if os.path.exists(path):
-                os.remove(path)
-            summary['databases'].append(name)
-        except OSError as e:
-            summary['databases'].append(f'{name} (error: {e})')
-
-    # 2. Clean uploaded files, preserving the default avatar.
-    keep = {'default.png'}
-    try:
-        for fname in os.listdir(UPLOAD_FOLDER):
-            if fname in keep:
-                continue
-            fpath = os.path.join(UPLOAD_FOLDER, fname)
-            try:
-                if os.path.isfile(fpath):
-                    os.remove(fpath)
-                    summary['uploads_removed'] += 1
-            except OSError:
-                pass
-    except OSError:
-        pass
-
-    # 3. Reset difficulty toggles to defaults (all insecure).
-    try:
-        save_lab_config(dict(DEFAULT_LAB_CONFIG))
-    except OSError:
-        summary['config'] = 'error'
-
-    # 4. Reset in-memory rate-limit counters.
-    LOGIN_ATTEMPTS.clear()
-
-    # 5. Rebuild the databases from embedded seed data.
-    init_user_db()
-    init_shop_db()
-    init_race_lab_db()
-
-    return summary
-
-
-@app.route('/lab/reset', methods=['POST'])
+@app.post('/lab/reset')
+@admin_required
 def lab_reset():
-    """Full lab reset triggered from the /lab control panel."""
-    summary = full_lab_reset()
-    flash(
-        'Full lab reset complete — databases re-seeded, '
-        f"{summary['uploads_removed']} uploaded file(s) removed, toggles reset.",
-        'success')
-    return redirect(url_for('lab_panel'))
+    abort(405)
 
 
-@app.route('/lab', methods=['GET', 'POST'])
+@app.get('/lab')
+@admin_required
 def lab_panel():
-    """Instructor control panel to switch vulns between secure / insecure.
-
-    NOTE: intentionally unauthenticated so it is easy to use in a teaching
-    lab. Do NOT expose this on an untrusted network.
-    """
-    cfg = load_lab_config()
-
-    if request.method == 'POST':
-        if request.form.get('action') == 'reset':
-            cfg = dict(DEFAULT_LAB_CONFIG)
-        else:
-            submitted = request.form.getlist('secure')
-            for key in cfg:
-                cfg[key] = (key in submitted)
-        save_lab_config(cfg)
-        flash('Lab configuration updated.', 'success')
-        return redirect(url_for('lab_panel'))
-
-    items = []
-    for key, secure in cfg.items():
-        tag, label = LAB_LABELS.get(key, ('', key))
-        items.append({'key': key, 'tag': tag, 'label': label, 'secure': secure})
-    return render_template('lab_panel.html', items=items)
+    return render_template('lab_panel.html')
 
 
-# ============================================================
-# JWT AUTH MODULE (intentionally vulnerable)
-# ============================================================
-
-@app.route('/api/jwt/login', methods=['POST'])
+@app.post('/api/jwt/login')
 def jwt_login():
-    """Issue a JWT for valid credentials.
-
-    Accepts JSON {username, password} or form data. Token is signed with a
-    WEAK secret ('secret') using HS256 — brute-forceable offline.
-    """
-    data = request.get_json(silent=True) or request.form
-    username = data.get('username', '')
-    password = data.get('password', '')
-
-    conn = get_user_db()
-    c = conn.cursor()
-    c.execute('SELECT * FROM users WHERE username = ? AND password = ?', (username, password))
-    user = c.fetchone()
-    conn.close()
-
+    data=request.get_json(silent=True) or request.form
+    if not isinstance(data,dict) and not hasattr(data,'get'):
+        abort(400)
+    user=authenticate(data.get('username',''),data.get('password',''))
     if not user:
-        return jsonify({'error': 'Invalid credentials'}), 401
-
-    payload = {
-        'sub': user['id'],
-        'username': user['username'],
-        'role': user['role'],
-        'iat': int(time.time()),
-    }
-    token = jwt_encode(payload)
-    return jsonify({'token': token, 'token_type': 'Bearer'})
+        return jsonify(error='Invalid credentials'),401
+    now=int(time.time())
+    token=jwt.encode(dict(sub=str(user['id']),ver=user['auth_version'],iat=now,exp=now+900,iss='dv-bookshop-fixed',aud='dv-bookshop-api'),app.config['JWT_SECRET'],algorithm='HS256')
+    return jsonify(token=token,token_type='Bearer',expires_in=900)
 
 
-def _read_bearer_token():
-    auth = request.headers.get('Authorization', '')
-    if auth.startswith('Bearer '):
-        return auth[7:].strip()
-    return request.args.get('token', '')
-
-
-@app.route('/api/jwt/me')
+@app.get('/api/jwt/me')
 def jwt_me():
-    """Return the caller's identity from their JWT.
-
-    VULN (insecure mode): jwt_decode trusts alg=none and a weak secret, so an
-    attacker can forge any identity. Toggle 'JWT_verify' to enforce checks.
-    """
-    token = _read_bearer_token()
-    if not token:
-        return jsonify({'error': 'Missing token'}), 401
-    try:
-        payload = jwt_decode(token)
-    except ValueError as e:
-        return jsonify({'error': str(e)}), 401
-    return jsonify({'identity': payload})
+    user=token_identity()
+    return jsonify(identity=dict(sub=str(user['id']),username=user['username'],role=user['role']))
 
 
-@app.route('/api/jwt/admin')
+@app.get('/api/jwt/admin')
 def jwt_admin():
-    """Admin-only endpoint guarded solely by the JWT 'role' claim.
-
-    Forge a token with role=admin (via alg=none or the weak secret) to read
-    the flag. In secure mode the forged token fails verification first.
-    """
-    token = _read_bearer_token()
-    if not token:
-        return jsonify({'error': 'Missing token'}), 401
-    try:
-        payload = jwt_decode(token)
-    except ValueError as e:
-        return jsonify({'error': str(e)}), 401
-    if payload.get('role') != 'admin':
-        return jsonify({'error': 'Admin role required'}), 403
-
-    conn = get_user_db()
-    c = conn.cursor()
-    c.execute("SELECT secret_note FROM users WHERE username = 'admin'")
-    row = c.fetchone()
-    conn.close()
-    return jsonify({
-        'message': 'Welcome, admin.',
-        'flag': row['secret_note'] if row else None,
-    })
-
-
-# ============================================================
-# ISOLATED RACE-CONDITION LAB
-# ============================================================
-
-def _race_lab_user():
-    """Return the logged-in training user allowed to use the race lab."""
-    username = session.get('username')
-    if username not in {'alice_hacker', 'bob_secure'}:
-        return None
-    return username
-
-
-def _race_transfer_input():
-    """Read and validate the small transfer payload used by both lab routes."""
-    data = request.get_json(silent=True) or request.form
-    try:
-        amount = float(data.get('amount', 0))
-    except (TypeError, ValueError):
-        amount = 0
-    recipient = str(data.get('recipient', '')).strip()
-    if amount <= 0 or amount > 1000 or not recipient:
-        return None
-    return amount, recipient
+    user=token_identity()
+    if user['role']!='admin':
+        abort(403)
+    return jsonify(message='Welcome, admin.')
 
 
 @app.route('/api/race-lab/status')
@@ -2322,41 +1372,11 @@ def race_lab_safe_transfer():
         conn.close()
 
 
-@app.route('/api/race-lab/reset', methods=['POST'])
-@login_required
+@app.post('/api/race-lab/reset')
+@admin_required
 def race_lab_reset():
-    """Reset only race_lab.db; shop and user databases remain untouched."""
-    if not _race_lab_user():
-        return jsonify({'error': 'Use alice_hacker or bob_secure for the race lab'}), 403
-    init_race_lab_db(reset=True)
-    return jsonify({'status': 'race lab reset', 'shop_data_changed': False}), 200
+    abort(405)
 
 
-# ============================================================
-# ERROR HANDLERS
-# ============================================================
-
-@app.errorhandler(404)
-def not_found(e):
-    return render_template('error.html', error_code=404, error_message='Page not found'), 404
-
-
-@app.errorhandler(500)
-def server_error(e):
-    return render_template('error.html', error_code=500, error_message='Internal server error'), 500
-
-
-# ============================================================
-# MAIN
-# ============================================================
-
-if __name__ == '__main__':
-    init_user_db()
-    init_shop_db()
-    init_race_lab_db()
-    # BONUS — Not counted in the README's 13 categories, but real: debug
-    # mode enables Werkzeug's interactive debugger (a documented RCE
-    # vector if this ever becomes reachable from outside localhost), and
-    # host='0.0.0.0' binds to every network interface, not just loopback.
-    # Intentional for the lab; keep this on an isolated machine/network.
-    app.run(debug=True, host='0.0.0.0', port=5005)
+if __name__=='__main__':
+    app.run(host='127.0.0.1',port=int(os.environ.get('BOOKSHOP_PORT','5006')),debug=False)

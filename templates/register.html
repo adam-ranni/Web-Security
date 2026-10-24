@@ -21,6 +21,7 @@
 
                 <!-- Registration Form -->
                 <form action="/register" method="POST" id="register-form">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                     <!-- Account Info -->
                     <div class="form-section">
                         <h6 class="form-section-title">

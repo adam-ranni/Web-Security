@@ -49,6 +49,7 @@
 
                 <!-- Login Form -->
                 <form action="/login" method="POST">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                     <!-- L1: Open redirect via hidden 'next' parameter -->
                     <input type="hidden" name="next" value="{{ request.args.get('next', '/') }}">
 

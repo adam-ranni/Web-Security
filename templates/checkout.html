@@ -53,6 +53,7 @@
                 </div>
                 <div class="card-body">
                     <form action="{{ url_for('apply_coupon') }}" method="POST" class="d-flex gap-2">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                         <input type="text" name="code" id="coupon-code-input" 
                                class="form-control bg-dark text-light border-secondary" 
                                placeholder="Enter coupon code">
@@ -115,6 +116,7 @@
                     </div>
 
                     <form action="{{ url_for('checkout') }}" method="POST" id="checkout-form">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                         <!-- K3: Price manipulation — hidden total field -->
                         <input type="hidden" name="total" value="{{ total }}">
                         <button type="submit" class="btn btn-success w-100 btn-lg">

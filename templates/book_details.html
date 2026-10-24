@@ -73,6 +73,7 @@
 
                 <!-- Add to Cart Form (K1: allows negative quantity) -->
                 <form action="/add_to_cart/{{ book['id'] }}" method="POST" class="add-to-cart-form">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                     <div class="row align-items-end g-3">
                         <div class="col-auto">
                             <label class="form-label-cyber">Quantity</label>
@@ -142,6 +143,7 @@
             </h4>
             <div class="cyber-card">
                 <form action="/review/{{ book['id'] }}" method="POST">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                     <div class="mb-3">
                         <label class="form-label-cyber">Rating</label>
                         <select name="rating" class="form-select form-select-cyber" required>

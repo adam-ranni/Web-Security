@@ -48,6 +48,7 @@
                                 </td>
                                 <td class="text-center">
                                     <form action="/remove_from_cart/{{ item['id'] }}" method="POST" style="display:inline;">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                                         <button type="submit" class="btn btn-cyber btn-danger-cyber btn-sm" title="Remove">
                                             <i class="fas fa-trash-alt"></i>
                                         </button>

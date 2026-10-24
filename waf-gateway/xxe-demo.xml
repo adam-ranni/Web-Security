@@ -1,0 +1,12 @@
+<?xml version="1.0"?>
+<!DOCTYPE books [
+  <!ENTITY demo SYSTEM "file:///tmp/waf-xxe-marker.txt">
+]>
+<books>
+  <book>
+    <title>&demo;</title>
+    <author>Security Lab</author>
+    <price>1</price>
+    <description>Controlled XXE demonstration</description>
+  </book>
+</books>

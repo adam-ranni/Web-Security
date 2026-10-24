@@ -1,0 +1,9 @@
+<?xml version="1.0"?>
+<books>
+  <book>
+    <title>WAF_NORMAL_XML_CONTROL</title>
+    <author>Security Lab</author>
+    <price>1</price>
+    <description>Normal import without DTD or entities</description>
+  </book>
+</books>

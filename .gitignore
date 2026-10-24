@@ -1,0 +1,11 @@
+/bookshop-vulnerable/
+/bookshop-fixed/
+*.cookies
+.env
+.env.*
+!.env.example
+*.db
+*.sqlite3
+.venv/
+__pycache__/
+/waf-gateway/WAF_PATH_MARKER_ONLY

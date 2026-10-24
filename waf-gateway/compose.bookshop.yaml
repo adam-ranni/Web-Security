@@ -1,0 +1,13 @@
+services:
+  bookshop-vulnerable:
+    build:
+      context: ../bookshop-vulnerable
+      dockerfile: ../waf-gateway/Dockerfile.bookshop
+    ports:
+      - "127.0.0.1:5006:5005"
+    networks:
+      - backend
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
